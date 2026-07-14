@@ -1,0 +1,3639 @@
+// Speaker Enclosure Designer - Interactive 3D Shape Builder
+import * as THREE from "https://unpkg.com/three/build/three.module.js";
+import { OrbitControls } from "https://unpkg.com/three/addons/controls/OrbitControls.js";
+// --- Scene Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(22, 18, 22);
+camera.lookAt(0, 4, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 10;
+controls.maxDistance = 150;
+controls.maxPolarAngle = Math.PI / 2 + 0.3;
+controls.target.set(0, 4, 0);
+controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
+
+// --- Lights ---
+const ambientLight = new THREE.AmbientLight(0x404060, 0.6);
+scene.add(ambientLight);
+const dirLight = new THREE.DirectionalLight(0xffeedd, 1.5);
+dirLight.position.set(15, 25, 10);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.near = 1;
+dirLight.shadow.camera.far = 60;
+dirLight.shadow.camera.left = -20;
+dirLight.shadow.camera.right = 20;
+dirLight.shadow.camera.top = 20;
+dirLight.shadow.camera.bottom = -20;
+scene.add(dirLight);
+const fillLight = new THREE.DirectionalLight(0x8888ff, 0.4);
+fillLight.position.set(-10, 10, -10);
+scene.add(fillLight);
+const rimLight = new THREE.DirectionalLight(0xff8844, 0.3);
+rimLight.position.set(0, 5, -15);
+scene.add(rimLight);
+
+// --- Grid Floor ---
+const gridSize = 40;
+const gridDiv = 40;
+const gridHelper = new THREE.GridHelper(gridSize, gridDiv, 0x444466, 0x2a2a4a);
+scene.add(gridHelper);
+const floorGeom = new THREE.PlaneGeometry(gridSize, gridSize);
+const floorMat = new THREE.MeshStandardMaterial({ color: 0x16162a, roughness: 0.9, metalness: 0.1 });
+const floor = new THREE.Mesh(floorGeom, floorMat);
+floor.rotation.x = -Math.PI / 2;
+floor.receiveShadow = true;
+scene.add(floor);
+
+// --- Constants ---
+let WALL_THICKNESS = 1;
+const HANDLE_SIZE = 0.6;
+const SNAP_GRID = 0.1;
+const MAX_DIM = 30;
+const DEFAULT_PORT_LENGTH = 4;
+const EDGE_SPLIT_THRESHOLD = 1.2; // max distance from edge line to register a click
+
+// --- State ---
+let symmetrical = true;
+let statsExpanded = true;
+let portsExpanded = true;
+let tsExpanded = false;
+let toolbarEverOpened = false; // tracks if user has ever tapped the toolbar toggle
+let portDiameter = 6;
+let portMode = 'bassreflex';
+let selectedFaceForPort = null;
+let ports = [];
+let draggingPort = null;
+let draggingPortPlane = new THREE.Plane();
+let draggingPortOffset = new THREE.Vector3();
+let useMetric = false;
+
+// --- Undo/Redo History ---
+const MAX_UNDO = 50;
+let undoStack = [];
+let redoStack = [];
+
+function captureState() {
+  return {
+    vertices: cubeVertices.map(v => v.clone()),
+    edges: edges.map(e => [...e]),
+    faces: faces.map(f => ({ verts: [...f.verts], name: f.name })),
+    splits: new Set(splitVertices),
+    subdivEdges: new Set(subdivisionEdges),
+    ports: ports.map(p => ({ ...p })),
+    wallThickness: WALL_THICKNESS,
+  };
+}
+
+function restoreState(state) {
+  cubeVertices = state.vertices.map(v => v.clone());
+  edges = state.edges.map(e => [...e]);
+  faces = state.faces.map(f => ({ verts: [...f.verts], name: f.name }));
+  splitVertices = new Set(state.splits);
+  subdivisionEdges = new Set(state.subdivEdges || []);
+  ports = state.ports.map(p => ({ ...p }));
+  WALL_THICKNESS = state.wallThickness;
+  updateAll();
+  updateTSPanel();
+  refreshAllUI();
+  if (typeof updateActionRow === 'function') updateActionRow();
+}
+
+function saveUndoState() {
+  undoStack.push(captureState());
+  if (undoStack.length > MAX_UNDO) undoStack.shift();
+  redoStack = [];
+  if (typeof updateActionRow === 'function') updateActionRow();
+}
+
+function undo() {
+  if (undoStack.length === 0) return;
+  redoStack.push(captureState());
+  const prev = undoStack.pop();
+  restoreState(prev);
+}
+
+function redo() {
+  if (redoStack.length === 0) return;
+  undoStack.push(captureState());
+  const next = redoStack.pop();
+  restoreState(next);
+}
+
+// Thiele-Small params
+let tsParams = { fs: 35, qts: 0.4, vas: 50, portLength: 4 };
+
+// --- Unit Conversion Helpers ---
+const IN_TO_CM = 2.54;
+const SQIN_TO_SQCM = IN_TO_CM * IN_TO_CM;
+const CUIN_TO_LITERS = 0.016387064;
+const CUIN_TO_CUCM = 16.387064;
+const CUIN_TO_CUFT = 1 / 1728;
+const CUIN_TO_CUM = CUIN_TO_CUCM / 1e6;
+
+function fmtLen(inches) {
+  if (useMetric) return `${(inches * IN_TO_CM).toFixed(1)} cm`;
+  return `${inches.toFixed(1)}"`;
+}
+function fmtLenVal(inches) {
+  if (useMetric) return (inches * IN_TO_CM).toFixed(1);
+  return inches.toFixed(1);
+}
+function fmtLenUnit() { return useMetric ? 'cm' : 'in'; }
+function fmtArea(sqin) {
+  if (useMetric) return `${(sqin * SQIN_TO_SQCM).toFixed(1)} cm²`;
+  return `${sqin.toFixed(1)} in²`;
+}
+function fmtAreaUnit() { return useMetric ? 'cm²' : 'in²'; }
+function fmtVolSmall(cuin) {
+  if (useMetric) return `${(cuin * CUIN_TO_LITERS).toFixed(2)} L`;
+  return `${cuin.toFixed(1)} in³`;
+}
+function fmtVolSmallUnit() { return useMetric ? 'L' : 'in³'; }
+function fmtVolLarge(cuin) {
+  if (useMetric) return `${(cuin * CUIN_TO_LITERS).toFixed(2)} L`;
+  return `${(cuin * CUIN_TO_CUFT).toFixed(3)} ft³`;
+}
+function fmtVolLargeUnit() { return useMetric ? 'L' : 'ft³'; }
+function fmtThickness(inches) {
+  if (useMetric) return `${(inches * IN_TO_CM).toFixed(1)} cm`;
+  const labels = { 0.5: '½"', 0.75: '¾"', 1: '1"', 1.5: '1½"' };
+  return labels[inches] || `${inches}"`;
+}
+function fmtDiameter(inches) {
+  if (useMetric) return `${(inches * IN_TO_CM).toFixed(1)} cm`;
+  return `${inches}"`;
+}
+function fmtTubeLenForInput(inches) {
+  if (useMetric) return (inches * IN_TO_CM).toFixed(1);
+  return inches.toFixed(1);
+}
+function parseTubeInput(val) {
+  const num = parseFloat(val);
+  if (isNaN(num)) return NaN;
+  return useMetric ? num / IN_TO_CM : num;
+}
+function tubeLenStep() { return useMetric ? 1 : 0.5; }
+function tubeLenMin() { return useMetric ? 2.5 : 1; }
+function tubeLenMax() { return useMetric ? 51 : 20; }
+function isPortLengthOutOfRangeMetricAware(inchesVal) {
+  return inchesVal < 3 || inchesVal > 10;
+}
+function fmtPortRangeWarning(inchesVal) {
+  if (useMetric) {
+    return inchesVal < 3
+      ? `too short (min ${(3 * IN_TO_CM).toFixed(1)} cm)`
+      : `too long (max ${(10 * IN_TO_CM).toFixed(1)} cm)`;
+  }
+  return inchesVal < 3 ? 'too short (min 3")' : 'too long (max 10")';
+}
+
+let cubeVertices = [
+  new THREE.Vector3(-6, 0, -6),
+  new THREE.Vector3(6, 0, -6),
+  new THREE.Vector3(6, 0, 6),
+  new THREE.Vector3(-6, 0, 6),
+  new THREE.Vector3(-6, 12, -6),
+  new THREE.Vector3(6, 12, -6),
+  new THREE.Vector3(6, 12, 6),
+  new THREE.Vector3(-6, 12, 6),
+];
+
+// --- Dynamic Topology ---
+// edges and faces are now mutable arrays
+let edges = [
+  [0,1],[1,2],[2,3],[3,0],
+  [4,5],[5,6],[6,7],[7,4],
+  [0,4],[1,5],[2,6],[3,7],
+];
+
+let faces = [
+  { verts: [0,1,5,4], name: "Front" },
+  { verts: [2,3,7,6], name: "Back" },
+  { verts: [3,0,4,7], name: "Left" },
+  { verts: [1,2,6,5], name: "Right" },
+  { verts: [4,5,6,7], name: "Top" },
+  { verts: [0,3,2,1], name: "Bottom" },
+];
+
+// Track which vertices were added by edge splits (for visual distinction)
+let splitVertices = new Set();
+
+// Track edges created by face subdivision (internal braces)
+let subdivisionEdges = new Set(); // stores edge index in the edges array
+
+// --- Face Subdivision State ---
+let subdivideMode = false;
+let subdivFirstVertex = null; // index of first selected vertex for subdivision
+let subdivHighlightMesh = null; // preview line mesh
+let subdivEligibleVerts = []; // vertex indices eligible for second pick
+
+function getSymmetryMap(idx) {
+  // For original 8 vertices, use the static map. For split vertices, no symmetry.
+  if (idx < 8) {
+    const map = {
+      0: [1, 3, 2], 1: [0, 2, 3], 2: [3, 1, 0], 3: [2, 0, 1],
+      4: [5, 7, 6], 5: [4, 6, 7], 6: [7, 5, 4], 7: [6, 4, 5],
+    };
+    return map[idx] || [];
+  }
+  return []; // split vertices don't mirror
+}
+
+let selectedHandle = null;
+let isDragging = false;
+let dragPlane = new THREE.Plane();
+let dragOffset = new THREE.Vector3();
+let touchMouse = new THREE.Vector2();
+let raycaster = new THREE.Raycaster();
+
+// Groups
+const enclosureGroup = new THREE.Group();
+scene.add(enclosureGroup);
+const handleGroup = new THREE.Group();
+scene.add(handleGroup);
+const edgeGroup = new THREE.Group();
+scene.add(edgeGroup);
+const dimensionGroup = new THREE.Group();
+scene.add(dimensionGroup);
+const portGroup = new THREE.Group();
+scene.add(portGroup);
+const crosshatchGroup = new THREE.Group();
+scene.add(crosshatchGroup);
+const braceGroup = new THREE.Group(); // 3D internal brace panels at subdivision edges
+scene.add(braceGroup);
+const edgeHitGroup = new THREE.Group(); // invisible wider cylinders for edge clicking
+scene.add(edgeHitGroup);
+
+// --- Materials ---
+const panelMaterial = new THREE.MeshPhysicalMaterial({
+  color: 0x8B6914, roughness: 0.6, metalness: 0.05,
+  clearcoat: 0.3, clearcoatRoughness: 0.4,
+  side: THREE.DoubleSide, transparent: true, opacity: 0.85,
+});
+const panelWireMaterial = new THREE.MeshBasicMaterial({
+  color: 0xddaa44, wireframe: true, transparent: true, opacity: 0.15,
+});
+const handleMaterial = new THREE.MeshPhysicalMaterial({
+  color: 0x00ccff, emissive: 0x004466, roughness: 0.2, metalness: 0.8,
+});
+const splitHandleMaterial = new THREE.MeshPhysicalMaterial({
+  color: 0xff44ff, emissive: 0x661166, roughness: 0.2, metalness: 0.8,
+});
+const edgeMaterial = new THREE.LineBasicMaterial({ color: 0xffcc44, linewidth: 2 });
+const portHoleMaterial = new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.DoubleSide });
+const portRingMaterial = new THREE.MeshPhysicalMaterial({
+  color: 0x222222, roughness: 0.3, metalness: 0.8, side: THREE.DoubleSide,
+});
+const portTubeMaterial = new THREE.MeshPhysicalMaterial({
+  color: 0x333333, roughness: 0.4, metalness: 0.6, side: THREE.DoubleSide,
+});
+const speakerConeMaterial = new THREE.MeshPhysicalMaterial({
+  color: 0x444444, roughness: 0.7, metalness: 0.1, side: THREE.DoubleSide,
+});
+const speakerDustcapMaterial = new THREE.MeshPhysicalMaterial({
+  color: 0x222222, roughness: 0.5, metalness: 0.3, side: THREE.DoubleSide,
+});
+const speakerSurroundMaterial = new THREE.MeshPhysicalMaterial({
+  color: 0x555555, roughness: 0.8, metalness: 0.0, side: THREE.DoubleSide,
+});
+const braceMaterial = new THREE.MeshPhysicalMaterial({
+  color: 0x9B7B2C, roughness: 0.55, metalness: 0.05,
+  clearcoat: 0.2, clearcoatRoughness: 0.5,
+  side: THREE.DoubleSide, transparent: true, opacity: 0.92,
+});
+const braceEdgeMaterial = new THREE.LineBasicMaterial({ color: 0x44ff44, linewidth: 2, transparent: true, opacity: 0.6 });
+
+// --- Glow Texture ---
+function createGlowTexture() {
+  const canvas = document.createElement("canvas");
+  canvas.width = 64; canvas.height = 64;
+  const ctx = canvas.getContext("2d");
+  const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gradient.addColorStop(0, "rgba(0,200,255,0.6)");
+  gradient.addColorStop(0.5, "rgba(0,200,255,0.15)");
+  gradient.addColorStop(1, "rgba(0,200,255,0)");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(canvas);
+}
+const glowTexture = createGlowTexture();
+
+function createSplitGlowTexture() {
+  const canvas = document.createElement("canvas");
+  canvas.width = 64; canvas.height = 64;
+  const ctx = canvas.getContext("2d");
+  const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gradient.addColorStop(0, "rgba(255,100,255,0.6)");
+  gradient.addColorStop(0.5, "rgba(255,100,255,0.15)");
+  gradient.addColorStop(1, "rgba(255,100,255,0)");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(canvas);
+}
+const splitGlowTexture = createSplitGlowTexture();
+
+// --- Helpers ---
+function clearGroup(group) {
+  while (group.children.length > 0) {
+    const child = group.children[0];
+    group.remove(child);
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) {
+      if (Array.isArray(child.material)) child.material.forEach(m => m.dispose());
+      else child.material.dispose();
+    }
+  }
+}
+
+function snapValue(val) {
+  return Math.round(val / SNAP_GRID) * SNAP_GRID;
+}
+
+// --- Handles ---
+const handleGeom = new THREE.SphereGeometry(HANDLE_SIZE, 16, 16);
+const splitHandleGeom = new THREE.SphereGeometry(HANDLE_SIZE * 0.85, 16, 16);
+let handles = [];
+
+function createHandles() {
+  clearGroup(handleGroup);
+  handles = [];
+  cubeVertices.forEach((v, i) => {
+    const isSplit = splitVertices.has(i);
+    const geom = isSplit ? splitHandleGeom : handleGeom;
+    const mat = (isSplit ? splitHandleMaterial : handleMaterial).clone();
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.position.copy(v);
+    mesh.userData.vertexIndex = i;
+    mesh.castShadow = true;
+    mesh.name = `handle_${i}`;
+    handleGroup.add(mesh);
+    handles.push(mesh);
+    const spriteMat = new THREE.SpriteMaterial({
+      map: isSplit ? splitGlowTexture : glowTexture,
+      transparent: true, depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    const sprite = new THREE.Sprite(spriteMat);
+    sprite.scale.set(2.5, 2.5, 1);
+    mesh.add(sprite);
+  });
+}
+
+// --- Edge Hit Meshes (invisible cylinders for click detection) ---
+let edgeHitMeshes = [];
+function buildEdgeHitMeshes() {
+  clearGroup(edgeHitGroup);
+  edgeHitMeshes = [];
+  edges.forEach(([a, b], idx) => {
+    const va = cubeVertices[a];
+    const vb = cubeVertices[b];
+    const mid = va.clone().add(vb).multiplyScalar(0.5);
+    const len = va.distanceTo(vb);
+    if (len < 0.5) return; // too short to split
+    const cylGeom = new THREE.CylinderGeometry(EDGE_SPLIT_THRESHOLD, EDGE_SPLIT_THRESHOLD, len, 8, 1);
+    const cylMat = new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide });
+    const cyl = new THREE.Mesh(cylGeom, cylMat);
+    cyl.position.copy(mid);
+    // Orient cylinder along edge
+    const dir = vb.clone().sub(va).normalize();
+    const up = new THREE.Vector3(0, 1, 0);
+    const quat = new THREE.Quaternion().setFromUnitVectors(up, dir);
+    cyl.setRotationFromQuaternion(quat);
+    cyl.userData.edgeIndex = idx;
+    cyl.userData.edgeVerts = [a, b];
+    edgeHitGroup.add(cyl);
+    edgeHitMeshes.push(cyl);
+  });
+}
+
+// --- Edge Split Logic ---
+function splitEdge(edgeIdx, splitPoint) {
+  const [a, b] = edges[edgeIdx];
+  const va = cubeVertices[a];
+  const vb = cubeVertices[b];
+
+  // Project splitPoint onto the edge line to get exact position
+  const edgeDir = vb.clone().sub(va);
+  const edgeLen = edgeDir.length();
+  const edgeNorm = edgeDir.clone().normalize();
+  const toPoint = splitPoint.clone().sub(va);
+  let t = toPoint.dot(edgeNorm) / edgeLen;
+  // Clamp t so new vertex isn't too close to endpoints (at least 15% from each end)
+  t = THREE.MathUtils.clamp(t, 0.15, 0.85);
+
+  const newPos = va.clone().add(edgeDir.clone().multiplyScalar(t));
+  newPos.x = snapValue(newPos.x);
+  newPos.y = snapValue(Math.max(0, newPos.y));
+  newPos.z = snapValue(newPos.z);
+
+  // Add new vertex
+  const newIdx = cubeVertices.length;
+  cubeVertices.push(newPos);
+  splitVertices.add(newIdx);
+
+  // Replace the old edge [a, b] with two new edges [a, newIdx] and [newIdx, b]
+  // First, update subdivision edge indices since splice shifts everything after edgeIdx
+  const updatedSubdivEdges = new Set();
+  subdivisionEdges.forEach(sei => {
+    if (sei === edgeIdx) {
+      // The split edge itself was a subdivision edge — both halves inherit it
+      updatedSubdivEdges.add(edgeIdx);
+      updatedSubdivEdges.add(edgeIdx + 1);
+    } else if (sei > edgeIdx) {
+      updatedSubdivEdges.add(sei + 1); // shifted by one due to splice inserting an extra edge
+    } else {
+      updatedSubdivEdges.add(sei);
+    }
+  });
+  subdivisionEdges = updatedSubdivEdges;
+
+  edges.splice(edgeIdx, 1, [a, newIdx], [newIdx, b]);
+
+  // Update faces: any face that has consecutive verts a, b (or b, a) needs newIdx inserted between them
+  faces.forEach(face => {
+    const verts = face.verts;
+    const len = verts.length;
+    for (let i = 0; i < len; i++) {
+      const curr = verts[i];
+      const next = verts[(i + 1) % len];
+      if ((curr === a && next === b) || (curr === b && next === a)) {
+        // Insert newIdx between curr and next
+        const insertPos = (i + 1) % len;
+        if (insertPos === 0) {
+          // next is at index 0, so append at end
+          verts.push(newIdx);
+        } else {
+          verts.splice(insertPos, 0, newIdx);
+        }
+        break; // each face only has this edge once
+      }
+    }
+  });
+
+  return newIdx;
+}
+
+// --- Face Subdivision Logic ---
+// Given a face and two vertex indices that lie on it, split the face into two faces
+// along a new edge between those vertices.
+function subdivideFace(faceIndex, vertA, vertB) {
+  const face = faces[faceIndex];
+  const verts = face.verts;
+  const idxA = verts.indexOf(vertA);
+  const idxB = verts.indexOf(vertB);
+  if (idxA === -1 || idxB === -1 || idxA === idxB) return false;
+
+  // Ensure idxA < idxB for consistent ordering
+  let iA = Math.min(idxA, idxB);
+  let iB = Math.max(idxA, idxB);
+
+  // The two vertex sets that form the two new faces
+  // Face1: verts from iA to iB (inclusive)
+  // Face2: verts from iB to iA (wrapping around, inclusive)
+  const face1Verts = [];
+  for (let i = iA; i <= iB; i++) {
+    face1Verts.push(verts[i]);
+  }
+
+  const face2Verts = [];
+  for (let i = iB; i < verts.length; i++) {
+    face2Verts.push(verts[i]);
+  }
+  for (let i = 0; i <= iA; i++) {
+    face2Verts.push(verts[i]);
+  }
+
+  // Each new face needs at least 3 vertices
+  if (face1Verts.length < 3 || face2Verts.length < 3) return false;
+
+  // Add the new edge (mark as subdivision/internal brace edge)
+  const newEdgeIdx = edges.length;
+  edges.push([vertA, vertB]);
+  subdivisionEdges.add(newEdgeIdx);
+
+  // Determine names for new faces
+  const baseName = face.name;
+  const newFace1 = { verts: face1Verts, name: baseName + '-A' };
+  const newFace2 = { verts: face2Verts, name: baseName + '-B' };
+
+  // Replace the original face with the two new ones
+  faces.splice(faceIndex, 1, newFace1, newFace2);
+
+  // Update port face indices - ports on the old face need reassignment
+  ports.forEach(p => {
+    if (p.faceIndex === faceIndex) {
+      // Determine which new face the port center falls in
+      const worldPos = faceUVToWorld_withOldBasis(faceIndex, p.u, p.v, verts);
+      // Check which new face contains this point
+      if (isPointInsideFaceVerts(newFace1.verts, worldPos)) {
+        // stays at faceIndex (which is now newFace1)
+        // Recalculate UV in new face basis
+        const newUV = worldToFaceUV(faceIndex, worldPos);
+        p.u = newUV.u;
+        p.v = newUV.v;
+      } else {
+        // Move to faceIndex + 1 (newFace2)
+        p.faceIndex = faceIndex + 1;
+        const newUV = worldToFaceUV(faceIndex + 1, worldPos);
+        p.u = newUV.u;
+        p.v = newUV.v;
+      }
+    } else if (p.faceIndex > faceIndex) {
+      // Shift face index since we inserted an extra face
+      p.faceIndex += 1;
+    }
+  });
+
+  return true;
+}
+
+// Helper: compute world position from UV using an arbitrary vert list (before face is changed)
+function faceUVToWorld_withOldBasis(faceIndex, u, v, vertList) {
+  // Use the same basis computation but with the given vert list
+  const vArr = vertList.map(i => cubeVertices[i]);
+  const normal = new THREE.Vector3();
+  for (let i = 0; i < vArr.length; i++) {
+    const curr = vArr[i];
+    const next = vArr[(i + 1) % vArr.length];
+    normal.x += (curr.y - next.y) * (curr.z + next.z);
+    normal.y += (curr.z - next.z) * (curr.x + next.x);
+    normal.z += (curr.x - next.x) * (curr.y + next.y);
+  }
+  if (normal.lengthSq() < 1e-10) {
+    const e1 = vArr[1].clone().sub(vArr[0]);
+    const e2 = vArr[vArr.length - 1].clone().sub(vArr[0]);
+    normal.copy(e1.cross(e2));
+  }
+  normal.normalize();
+
+  let bestLen = 0, bestU = null;
+  for (let i = 0; i < vArr.length; i++) {
+    const edge = vArr[(i + 1) % vArr.length].clone().sub(vArr[i]);
+    const len = edge.length();
+    if (len > bestLen) { bestLen = len; bestU = edge.clone().normalize(); }
+  }
+  if (!bestU) bestU = new THREE.Vector3(1, 0, 0);
+  const uDir = bestU.clone();
+  const vDir = new THREE.Vector3().crossVectors(normal, uDir).normalize();
+  const projected = vArr.map(p => ({ u: p.dot(uDir), v: p.dot(vDir) }));
+  let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+  projected.forEach(p => {
+    if (p.u < minU) minU = p.u; if (p.u > maxU) maxU = p.u;
+    if (p.v < minV) minV = p.v; if (p.v > maxV) maxV = p.v;
+  });
+  const uLen = (maxU - minU) || 1;
+  const vLen = (maxV - minV) || 1;
+  const worldU = minU + u * uLen;
+  const worldV = minV + v * vLen;
+  return uDir.clone().multiplyScalar(worldU).add(vDir.clone().multiplyScalar(worldV));
+}
+
+// Check if a point lies inside a face defined by a vert index list
+function isPointInsideFaceVerts(vertIdxList, point) {
+  const vArr = vertIdxList.map(i => cubeVertices[i]);
+  // Compute face normal
+  const normal = new THREE.Vector3();
+  for (let i = 0; i < vArr.length; i++) {
+    const curr = vArr[i];
+    const next = vArr[(i + 1) % vArr.length];
+    normal.x += (curr.y - next.y) * (curr.z + next.z);
+    normal.y += (curr.z - next.z) * (curr.x + next.x);
+    normal.z += (curr.x - next.x) * (curr.y + next.y);
+  }
+  normal.normalize();
+  // Pick projection plane
+  const ax = Math.abs(normal.x), ay = Math.abs(normal.y), az = Math.abs(normal.z);
+  let getU, getV;
+  if (ax >= ay && ax >= az) { getU = p => p.y; getV = p => p.z; }
+  else if (ay >= ax && ay >= az) { getU = p => p.x; getV = p => p.z; }
+  else { getU = p => p.x; getV = p => p.y; }
+  const pu = getU(point), pv = getV(point);
+  const poly = vArr.map(p => ({ u: getU(p), v: getV(p) }));
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].u, yi = poly[i].v;
+    const xj = poly[j].u, yj = poly[j].v;
+    if (((yi > pv) !== (yj > pv)) && (pu < (xj - xi) * (pv - yi) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
+
+// Find which faces a vertex belongs to
+function getFacesForVertex(vertIdx) {
+  const result = [];
+  faces.forEach((face, fi) => {
+    if (face.verts.includes(vertIdx)) result.push(fi);
+  });
+  return result;
+}
+
+// Find vertices on a given face that are eligible as subdivision endpoints:
+// They must be non-adjacent to the first vertex in the face's vert list.
+function getSubdivEligibleVerts(faceIndex, firstVert) {
+  const face = faces[faceIndex];
+  const verts = face.verts;
+  const idx = verts.indexOf(firstVert);
+  if (idx === -1) return [];
+  const n = verts.length;
+  const eligible = [];
+  for (let i = 0; i < n; i++) {
+    // Skip self, and skip immediate neighbors (adjacent)
+    if (i === idx) continue;
+    if (i === (idx + 1) % n) continue;
+    if (i === (idx - 1 + n) % n) continue;
+    eligible.push(verts[i]);
+  }
+  return eligible;
+}
+
+// Get all faces that share two specific vertices (i.e., the face to subdivide)
+function getSharedFace(vertA, vertB) {
+  for (let fi = 0; fi < faces.length; fi++) {
+    const verts = faces[fi].verts;
+    if (verts.includes(vertA) && verts.includes(vertB)) return fi;
+  }
+  return -1;
+}
+
+// Reset subdivision mode
+function cancelSubdivide() {
+  subdivideMode = false;
+  subdivFirstVertex = null;
+  subdivEligibleVerts = [];
+  if (subdivHighlightMesh) {
+    scene.remove(subdivHighlightMesh);
+    if (subdivHighlightMesh.geometry) subdivHighlightMesh.geometry.dispose();
+    if (subdivHighlightMesh.material) subdivHighlightMesh.material.dispose();
+    subdivHighlightMesh = null;
+  }
+  // Reset handle colors
+  handles.forEach(h => {
+    const isSplit = splitVertices.has(h.userData.vertexIndex);
+    if (h.material && h.material.color) h.material.color.setHex(isSplit ? 0xff44ff : 0x00ccff);
+    if (h.material && h.material.emissive) h.material.emissive.setHex(isSplit ? 0x661166 : 0x004466);
+    h.scale.set(1, 1, 1);
+  });
+  updateSubdivideUI();
+}
+
+// Try to perform subdivision click
+function trySubdivideClick(pxy) {
+  if (!subdivideMode) return false;
+
+  touchMouse.set(pxy.x, pxy.y);
+  raycaster.setFromCamera(touchMouse, camera);
+  const hits = raycaster.intersectObjects(handles);
+  if (hits.length === 0) return false;
+
+  const clickedHandle = hits[0].object;
+  const vertIdx = clickedHandle.userData.vertexIndex;
+  if (vertIdx === undefined) return false;
+
+  if (subdivFirstVertex === null) {
+    // First vertex selection - must be on a face with enough verts for subdivision
+    // Check if any face containing this vertex has at least 4 verts (minimum for subdivision)
+    const facesWithVert = getFacesForVertex(vertIdx);
+    const eligibleFaces = facesWithVert.filter(fi => faces[fi].verts.length >= 4);
+    if (eligibleFaces.length === 0) return false;
+
+    subdivFirstVertex = vertIdx;
+
+    // Compute all eligible second vertices across all eligible faces
+    subdivEligibleVerts = [];
+    eligibleFaces.forEach(fi => {
+      const eligible = getSubdivEligibleVerts(fi, vertIdx);
+      eligible.forEach(v => {
+        if (!subdivEligibleVerts.includes(v)) subdivEligibleVerts.push(v);
+      });
+    });
+
+    if (subdivEligibleVerts.length === 0) {
+      subdivFirstVertex = null;
+      return false;
+    }
+
+    // Highlight: make first vertex green, eligible verts yellow, others dim
+    handles.forEach(h => {
+      const vi = h.userData.vertexIndex;
+      if (vi === vertIdx) {
+        h.material.color.setHex(0x44ff44);
+        h.material.emissive.setHex(0x22aa22);
+        h.scale.set(1.5, 1.5, 1.5);
+      } else if (subdivEligibleVerts.includes(vi)) {
+        h.material.color.setHex(0xffff44);
+        h.material.emissive.setHex(0xaaaa22);
+        h.scale.set(1.3, 1.3, 1.3);
+      } else {
+        h.material.color.setHex(0x333333);
+        h.material.emissive.setHex(0x111111);
+        h.scale.set(0.7, 0.7, 0.7);
+      }
+    });
+
+    updateSubdivideUI();
+    return true;
+
+  } else {
+    // Second vertex selection
+    if (!subdivEligibleVerts.includes(vertIdx)) {
+      // If clicking first vertex again, deselect
+      if (vertIdx === subdivFirstVertex) {
+        subdivFirstVertex = null;
+        subdivEligibleVerts = [];
+        // Reset colors
+        handles.forEach(h => {
+          const isSplit = splitVertices.has(h.userData.vertexIndex);
+          if (h.material && h.material.color) h.material.color.setHex(isSplit ? 0xff44ff : 0x00ccff);
+          if (h.material && h.material.emissive) h.material.emissive.setHex(isSplit ? 0x661166 : 0x004466);
+          h.scale.set(1, 1, 1);
+        });
+        updateSubdivideUI();
+        return true;
+      }
+      return false;
+    }
+
+    // Find the shared face
+    const faceIdx = getSharedFace(subdivFirstVertex, vertIdx);
+    if (faceIdx === -1) return false;
+
+    // Perform subdivision
+    saveUndoState();
+    const success = subdivideFace(faceIdx, subdivFirstVertex, vertIdx);
+    if (success) {
+      showSubdivideFlash(cubeVertices[subdivFirstVertex], cubeVertices[vertIdx]);
+      // Exit subdivide mode after successful split
+      subdivFirstVertex = null;
+      subdivEligibleVerts = [];
+      updateAll();
+      updateTSPanel();
+      updateSubdivideUI();
+      return true;
+    }
+    return false;
+  }
+}
+
+// Visual flash for subdivision
+function showSubdivideFlash(posA, posB) {
+  const mid = posA.clone().add(posB).multiplyScalar(0.5);
+  const len = posA.distanceTo(posB);
+  const dir = posB.clone().sub(posA).normalize();
+
+  const flashGeom = new THREE.CylinderGeometry(0.15, 0.15, len, 8);
+  const flashMat = new THREE.MeshBasicMaterial({ color: 0x44ff44, transparent: true, opacity: 0.9 });
+  const flash = new THREE.Mesh(flashGeom, flashMat);
+  flash.position.copy(mid);
+  const up = new THREE.Vector3(0, 1, 0);
+  const quat = new THREE.Quaternion().setFromUnitVectors(up, dir);
+  flash.setRotationFromQuaternion(quat);
+  scene.add(flash);
+
+  let t = 0;
+  const fadeOut = () => {
+    t += 0.03;
+    flash.scale.set(1 + t * 3, 1, 1 + t * 3);
+    flashMat.opacity = 0.9 * (1 - t);
+    if (t < 1) {
+      requestAnimationFrame(fadeOut);
+    } else {
+      scene.remove(flash);
+      flashGeom.dispose();
+      flashMat.dispose();
+    }
+  };
+  fadeOut();
+}
+
+// Update subdivide preview line
+function updateSubdividePreview(pxy) {
+  if (!subdivideMode || subdivFirstVertex === null) {
+    if (subdivHighlightMesh) {
+      scene.remove(subdivHighlightMesh);
+      if (subdivHighlightMesh.geometry) subdivHighlightMesh.geometry.dispose();
+      if (subdivHighlightMesh.material) subdivHighlightMesh.material.dispose();
+      subdivHighlightMesh = null;
+    }
+    return;
+  }
+
+  touchMouse.set(pxy.x, pxy.y);
+  raycaster.setFromCamera(touchMouse, camera);
+  const hits = raycaster.intersectObjects(handles);
+
+  let targetPos = null;
+  let validTarget = false;
+
+  if (hits.length > 0) {
+    const vi = hits[0].object.userData.vertexIndex;
+    if (subdivEligibleVerts.includes(vi)) {
+      targetPos = cubeVertices[vi].clone();
+      validTarget = true;
+    }
+  }
+
+  if (subdivHighlightMesh) {
+    scene.remove(subdivHighlightMesh);
+    if (subdivHighlightMesh.geometry) subdivHighlightMesh.geometry.dispose();
+    if (subdivHighlightMesh.material) subdivHighlightMesh.material.dispose();
+    subdivHighlightMesh = null;
+  }
+
+  if (targetPos && validTarget) {
+    const startPos = cubeVertices[subdivFirstVertex];
+    const geom = new THREE.BufferGeometry().setFromPoints([startPos.clone(), targetPos]);
+    const mat = new THREE.LineBasicMaterial({ color: 0x44ff44, linewidth: 2, transparent: true, opacity: 0.8 });
+    subdivHighlightMesh = new THREE.Line(geom, mat);
+    subdivHighlightMesh.name = 'subdivPreviewLine';
+    scene.add(subdivHighlightMesh);
+  }
+}
+
+// --- Face Hit Meshes ---
+let faceHitMeshes = [];
+function buildFaceHitMeshes() {
+  faceHitMeshes.forEach(m => {
+    scene.remove(m);
+    if (m.geometry) m.geometry.dispose();
+    if (m.material) m.material.dispose();
+  });
+  faceHitMeshes = [];
+  faces.forEach((face, fi) => {
+    const v = face.verts.map(i => cubeVertices[i]);
+    const normal = getFaceNormal(fi);
+    const tris = triangulateFace(v, normal);
+    const positions = [];
+    tris.forEach(([a, b, c]) => {
+      positions.push(v[a].x, v[a].y, v[a].z);
+      positions.push(v[b].x, v[b].y, v[b].z);
+      positions.push(v[c].x, v[c].y, v[c].z);
+    });
+    if (positions.length === 0) {
+      for (let i = 1; i < v.length - 1; i++) {
+        positions.push(v[0].x, v[0].y, v[0].z);
+        positions.push(v[i].x, v[i].y, v[i].z);
+        positions.push(v[i+1].x, v[i+1].y, v[i+1].z);
+      }
+    }
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geom.computeVertexNormals();
+    const mat = new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide });
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.userData.faceIndex = fi;
+    faceHitMeshes.push(mesh);
+    scene.add(mesh);
+  });
+}
+
+function getFaceNormal(faceIndex) {
+  const face = faces[faceIndex];
+  const v = face.verts.map(i => cubeVertices[i]);
+  // Use Newell's method for robust normal of N-gon
+  const normal = new THREE.Vector3();
+  for (let i = 0; i < v.length; i++) {
+    const curr = v[i];
+    const next = v[(i + 1) % v.length];
+    normal.x += (curr.y - next.y) * (curr.z + next.z);
+    normal.y += (curr.z - next.z) * (curr.x + next.x);
+    normal.z += (curr.x - next.x) * (curr.y + next.y);
+  }
+  if (normal.lengthSq() < 1e-10) {
+    // Fallback: use first three non-collinear verts
+    const e1 = v[1].clone().sub(v[0]);
+    const e2 = v[v.length - 1].clone().sub(v[0]);
+    normal.copy(e1.cross(e2));
+  }
+  return normal.normalize();
+}
+
+// Compute a robust 2D coordinate system for any N-gon face.
+// Returns origin, uAxis, vAxis (both unit vectors in the face plane),
+// and uLen/vLen (the bounding extent of the face projected onto these axes).
+// Also returns min2D so we can properly map 0..1 UV across the full face.
+function getFaceBasis(faceIndex) {
+  const face = faces[faceIndex];
+  const v = face.verts.map(i => cubeVertices[i]);
+  const normal = getFaceNormal(faceIndex);
+
+  // Pick the longest edge as the U axis for stability
+  let bestLen = 0;
+  let bestU = null;
+  for (let i = 0; i < v.length; i++) {
+    const edge = v[(i + 1) % v.length].clone().sub(v[i]);
+    const len = edge.length();
+    if (len > bestLen) {
+      bestLen = len;
+      bestU = edge.clone().normalize();
+    }
+  }
+  if (!bestU || bestLen < 1e-6) bestU = new THREE.Vector3(1, 0, 0);
+
+  // V axis is perpendicular to U in the face plane
+  const uDir = bestU.clone();
+  const vDir = new THREE.Vector3().crossVectors(normal, uDir).normalize();
+
+  // Project all vertices onto this 2D system to find bounding box
+  const projected = v.map(p => ({ u: p.dot(uDir), v: p.dot(vDir) }));
+  let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+  projected.forEach(p => {
+    if (p.u < minU) minU = p.u;
+    if (p.u > maxU) maxU = p.u;
+    if (p.v < minV) minV = p.v;
+    if (p.v > maxV) maxV = p.v;
+  });
+
+  const uLen = maxU - minU;
+  const vLen = maxV - minV;
+
+  // Origin in 3D is the point corresponding to (minU, minV)
+  const origin = uDir.clone().multiplyScalar(minU).add(vDir.clone().multiplyScalar(minV));
+
+  return {
+    origin,
+    uDir, vDir, normal,
+    uLen: uLen || 1,
+    vLen: vLen || 1,
+    minU, minV, maxU, maxV,
+  };
+}
+
+function worldToFaceUV(faceIndex, worldPoint) {
+  const basis = getFaceBasis(faceIndex);
+  const pu = worldPoint.dot(basis.uDir);
+  const pv = worldPoint.dot(basis.vDir);
+  return {
+    u: (pu - basis.minU) / basis.uLen,
+    v: (pv - basis.minV) / basis.vLen,
+  };
+}
+
+function faceUVToWorld(faceIndex, u, v) {
+  const basis = getFaceBasis(faceIndex);
+  const worldU = basis.minU + u * basis.uLen;
+  const worldV = basis.minV + v * basis.vLen;
+  return basis.uDir.clone().multiplyScalar(worldU).add(basis.vDir.clone().multiplyScalar(worldV));
+}
+
+function getOutwardNormal(faceIndex) {
+  const normal = getFaceNormal(faceIndex);
+  const face = faces[faceIndex];
+  const v = face.verts.map(i => cubeVertices[i]);
+  const faceCenter = new THREE.Vector3();
+  v.forEach(vv => faceCenter.add(vv));
+  faceCenter.divideScalar(v.length);
+  const boxCenter = new THREE.Vector3();
+  cubeVertices.forEach(cv => boxCenter.add(cv));
+  boxCenter.divideScalar(cubeVertices.length);
+  if (normal.dot(faceCenter.clone().sub(boxCenter)) < 0) normal.negate();
+  return normal;
+}
+
+function getInwardNormal(faceIndex) {
+  return getOutwardNormal(faceIndex).negate();
+}
+
+// --- Build Enclosure ---
+// Ear-clipping triangulation for N-gon faces (handles convex and mildly concave polygons)
+function triangulateFace(face3DVerts, faceNormal) {
+  if (face3DVerts.length < 3) return [];
+  if (face3DVerts.length === 3) return [[0, 1, 2]];
+
+  // Project to 2D using the face normal to pick the dominant plane
+  const ax = Math.abs(faceNormal.x);
+  const ay = Math.abs(faceNormal.y);
+  const az = Math.abs(faceNormal.z);
+  let getU, getV;
+  if (ax >= ay && ax >= az) {
+    getU = (p) => p.y; getV = (p) => p.z;
+  } else if (ay >= ax && ay >= az) {
+    getU = (p) => p.x; getV = (p) => p.z;
+  } else {
+    getU = (p) => p.x; getV = (p) => p.y;
+  }
+
+  const pts2D = face3DVerts.map(p => ({ u: getU(p), v: getV(p) }));
+
+  // Ensure CCW winding
+  let area = 0;
+  for (let i = 0; i < pts2D.length; i++) {
+    const j = (i + 1) % pts2D.length;
+    area += pts2D[i].u * pts2D[j].v;
+    area -= pts2D[j].u * pts2D[i].v;
+  }
+  const indices = [];
+  for (let i = 0; i < pts2D.length; i++) indices.push(i);
+  if (area < 0) indices.reverse();
+
+  const triangles = [];
+  const remaining = [...indices];
+
+  function isEar(prev, curr, next) {
+    const a = pts2D[prev], b = pts2D[curr], c = pts2D[next];
+    // Check if this triangle is CCW (convex)
+    const cross = (b.u - a.u) * (c.v - a.v) - (b.v - a.v) * (c.u - a.u);
+    if (cross <= 0) return false;
+    // Check no other vertex is inside this triangle
+    for (let i = 0; i < remaining.length; i++) {
+      const pi = remaining[i];
+      if (pi === prev || pi === curr || pi === next) continue;
+      if (pointInTriangle2D(pts2D[pi], a, b, c)) return false;
+    }
+    return true;
+  }
+
+  let safety = remaining.length * 3;
+  while (remaining.length > 3 && safety-- > 0) {
+    let earFound = false;
+    for (let i = 0; i < remaining.length; i++) {
+      const prev = remaining[(i + remaining.length - 1) % remaining.length];
+      const curr = remaining[i];
+      const next = remaining[(i + 1) % remaining.length];
+      if (isEar(prev, curr, next)) {
+        triangles.push([prev, curr, next]);
+        remaining.splice(i, 1);
+        earFound = true;
+        break;
+      }
+    }
+    if (!earFound) break; // fallback: can't find ear, use fan
+  }
+  if (remaining.length === 3) {
+    triangles.push([remaining[0], remaining[1], remaining[2]]);
+  } else if (remaining.length > 3) {
+    // Fallback to fan triangulation
+    for (let i = 1; i < remaining.length - 1; i++) {
+      triangles.push([remaining[0], remaining[i], remaining[i + 1]]);
+    }
+  }
+  return triangles;
+}
+
+function pointInTriangle2D(p, a, b, c) {
+  const d1 = (p.u - c.u) * (a.v - c.v) - (a.u - c.u) * (p.v - c.v);
+  const d2 = (p.u - a.u) * (b.v - a.v) - (b.u - a.u) * (p.v - a.v);
+  const d3 = (p.u - b.u) * (c.v - b.v) - (c.u - b.u) * (p.v - b.v);
+  const hasNeg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+  const hasPos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+  return !(hasNeg && hasPos);
+}
+
+function buildEnclosure() {
+  clearGroup(enclosureGroup);
+  clearGroup(edgeGroup);
+  faces.forEach((face, fi) => {
+    const v = face.verts.map(i => cubeVertices[i]);
+    const normal = getFaceNormal(fi);
+    const tris = triangulateFace(v, normal);
+    const positions = [];
+    tris.forEach(([a, b, c]) => {
+      positions.push(v[a].x, v[a].y, v[a].z);
+      positions.push(v[b].x, v[b].y, v[b].z);
+      positions.push(v[c].x, v[c].y, v[c].z);
+    });
+    if (positions.length === 0) {
+      // Fallback: fan triangulation
+      for (let i = 1; i < v.length - 1; i++) {
+        positions.push(v[0].x, v[0].y, v[0].z);
+        positions.push(v[i].x, v[i].y, v[i].z);
+        positions.push(v[i+1].x, v[i+1].y, v[i+1].z);
+      }
+    }
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geom.computeVertexNormals();
+    const panel = new THREE.Mesh(geom, panelMaterial);
+    panel.castShadow = true; panel.receiveShadow = true;
+    panel.name = `panel_${fi}`;
+    enclosureGroup.add(panel);
+    const wirePanel = new THREE.Mesh(geom.clone(), panelWireMaterial);
+    wirePanel.name = `panelWire_${fi}`;
+    enclosureGroup.add(wirePanel);
+  });
+  edges.forEach(([a, b], idx) => {
+    const geom = new THREE.BufferGeometry().setFromPoints([cubeVertices[a].clone(), cubeVertices[b].clone()]);
+    const isSubdivEdge = subdivisionEdges.has(idx);
+    const mat = isSubdivEdge ? braceEdgeMaterial : edgeMaterial;
+    const line = new THREE.Line(geom, mat);
+    line.name = `edge_${idx}`;
+    edgeGroup.add(line);
+  });
+  buildFaceHitMeshes();
+  buildEdgeHitMeshes();
+  buildBraces();
+  buildCrosshatch();
+  buildPortVisuals();
+}
+
+// --- Internal Brace Panels (3D slabs at subdivision edges) ---
+function buildBraces() {
+  clearGroup(braceGroup);
+
+  subdivisionEdges.forEach(edgeIdx => {
+    if (edgeIdx >= edges.length) return;
+    const [a, b] = edges[edgeIdx];
+    const va = cubeVertices[a];
+    const vb = cubeVertices[b];
+    const edgeLen = va.distanceTo(vb);
+    if (edgeLen < 0.1) return;
+
+    // Find the two faces that share this edge
+    const adjacentFaces = [];
+    faces.forEach((face, fi) => {
+      const verts = face.verts;
+      const hasA = verts.includes(a);
+      const hasB = verts.includes(b);
+      if (hasA && hasB) adjacentFaces.push(fi);
+    });
+    if (adjacentFaces.length < 2) return;
+
+    // Compute the inward normal — average of the two face inward normals
+    // This gives the direction the brace panel extends into the box interior
+    const inNorm0 = getOutwardNormal(adjacentFaces[0]).negate();
+    const inNorm1 = getOutwardNormal(adjacentFaces[1]).negate();
+    // The brace should extend perpendicular to the edge along the interior
+    // Use the face normals to determine the interior direction
+
+    // Edge direction
+    const edgeDir = vb.clone().sub(va).normalize();
+
+    // The brace plane normal is perpendicular to the edge and lies in the interior
+    // Compute it from the two face normals
+    const avgInward = inNorm0.clone().add(inNorm1).normalize();
+
+    // The brace extends perpendicular to the edge, into the interior
+    // Project avgInward onto the plane perpendicular to the edge
+    const braceDir = avgInward.clone().sub(edgeDir.clone().multiplyScalar(avgInward.dot(edgeDir))).normalize();
+
+    if (braceDir.lengthSq() < 0.01) return;
+
+    // Calculate how deep the brace should extend — use the enclosure interior depth
+    // Raycast from edge midpoint inward to find the opposite wall
+    const edgeMid = va.clone().add(vb).multiplyScalar(0.5);
+    const braceDepth = calcBraceDepth(edgeMid, braceDir, edgeIdx);
+    if (braceDepth < WALL_THICKNESS * 2) return; // too shallow
+
+    // Actual brace depth = full interior depth minus wall thickness on the far side
+    const actualDepth = braceDepth - WALL_THICKNESS;
+    if (actualDepth < 0.5) return;
+
+    // Build a 3D box (slab) for the brace:
+    // - along the edge (length = edgeLen)
+    // - into the interior (depth = actualDepth)
+    // - thickness = WALL_THICKNESS
+
+    // The slab's local coordinate system:
+    // X = along edge, Y = braceDir (into interior), Z = perpendicular (thickness)
+    const thicknessDir = new THREE.Vector3().crossVectors(edgeDir, braceDir).normalize();
+
+    // 8 corners of the brace slab
+    const halfThick = WALL_THICKNESS / 2;
+    const corners = [];
+    for (let xi = 0; xi <= 1; xi++) {
+      for (let yi = 0; yi <= 1; yi++) {
+        for (let zi = 0; zi <= 1; zi++) {
+          const p = va.clone()
+            .add(edgeDir.clone().multiplyScalar(xi * edgeLen))
+            .add(braceDir.clone().multiplyScalar(yi * actualDepth))
+            .add(thicknessDir.clone().multiplyScalar((zi - 0.5) * WALL_THICKNESS));
+          corners.push(p);
+        }
+      }
+    }
+
+    // corners indices: [0]=va+0+0-ht, [1]=va+0+0+ht, [2]=va+0+d-ht, [3]=va+0+d+ht
+    //                  [4]=vb+0+0-ht, [5]=vb+0+0+ht, [6]=vb+0+d-ht, [7]=vb+0+d+ht
+
+    // 6 faces of the box
+    const boxFaces = [
+      [0, 4, 5, 1], // front (near edge)
+      [2, 3, 7, 6], // back (far edge)
+      [0, 1, 3, 2], // left (va side)
+      [4, 6, 7, 5], // right (vb side)
+      [1, 5, 7, 3], // top (+thickness)
+      [0, 2, 6, 4], // bottom (-thickness)
+    ];
+
+    const positions = [];
+    boxFaces.forEach(face => {
+      // Two triangles per quad
+      const c = face.map(i => corners[i]);
+      positions.push(c[0].x, c[0].y, c[0].z, c[1].x, c[1].y, c[1].z, c[2].x, c[2].y, c[2].z);
+      positions.push(c[0].x, c[0].y, c[0].z, c[2].x, c[2].y, c[2].z, c[3].x, c[3].y, c[3].z);
+    });
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geom.computeVertexNormals();
+    const mesh = new THREE.Mesh(geom, braceMaterial);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.name = `brace_${edgeIdx}`;
+    braceGroup.add(mesh);
+
+    // Outline edges for the brace
+    const outlinePoints = [
+      corners[0], corners[4], corners[5], corners[1], corners[0], // front face loop
+      corners[2], corners[6], corners[7], corners[3], corners[2], // back face loop
+    ];
+    const lineGeom = new THREE.BufferGeometry().setFromPoints(outlinePoints);
+    const line = new THREE.Line(lineGeom, braceEdgeMaterial);
+    line.name = `braceEdge_${edgeIdx}`;
+    braceGroup.add(line);
+
+    // Connect front to back
+    const connectors = [[0,2],[1,3],[4,6],[5,7]];
+    connectors.forEach(([ci, cj]) => {
+      const cGeom = new THREE.BufferGeometry().setFromPoints([corners[ci], corners[cj]]);
+      const cLine = new THREE.Line(cGeom, braceEdgeMaterial);
+      cLine.name = `braceConn_${edgeIdx}_${ci}_${cj}`;
+      braceGroup.add(cLine);
+    });
+
+    // Brace label
+    const labelPos = edgeMid.clone()
+      .add(braceDir.clone().multiplyScalar(actualDepth * 0.5))
+      .add(thicknessDir.clone().multiplyScalar(halfThick + 0.3));
+    const canvas = document.createElement("canvas");
+    canvas.width = 200; canvas.height = 48;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(4, 4, 192, 40, 8); else ctx.rect(4, 4, 192, 40);
+    ctx.fill();
+    ctx.fillStyle = "#44ff44";
+    ctx.font = "bold 16px Arial";
+    ctx.textAlign = "center";
+    ctx.fillText(`BRACE ${fmtLen(actualDepth)}×${fmtThickness(WALL_THICKNESS)}`, 100, 30);
+    const texture = new THREE.CanvasTexture(canvas);
+    const spriteMat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+    const sprite = new THREE.Sprite(spriteMat);
+    sprite.position.copy(labelPos);
+    sprite.scale.set(3.5, 1.0, 1);
+    sprite.name = `braceLabel_${edgeIdx}`;
+    braceGroup.add(sprite);
+  });
+}
+
+// Calculate how deep a brace can extend from a point along a direction
+// by checking intersection with opposite enclosure faces
+function calcBraceDepth(origin, direction, excludeEdgeIdx) {
+  // Find the two faces adjacent to this subdivision edge
+  const [ea, eb] = edges[excludeEdgeIdx];
+  const adjacentFaceIndices = [];
+  faces.forEach((face, fi) => {
+    if (face.verts.includes(ea) && face.verts.includes(eb)) {
+      adjacentFaceIndices.push(fi);
+    }
+  });
+
+  let minDist = 100; // large default
+  faces.forEach((face, fi) => {
+    // Skip the two faces that share this edge
+    if (adjacentFaceIndices.includes(fi)) return;
+
+    const faceVerts = face.verts.map(i => cubeVertices[i]);
+    const normal = getFaceNormal(fi);
+
+    // Check if the ray from origin along direction intersects this face's plane
+    const denom = normal.dot(direction);
+    if (Math.abs(denom) < 1e-6) return; // parallel
+
+    const t = normal.dot(faceVerts[0].clone().sub(origin)) / denom;
+    if (t <= 0) return; // behind origin
+
+    // Check if intersection point is inside the face polygon
+    const hitPoint = origin.clone().add(direction.clone().multiplyScalar(t));
+    if (isPointInsideFaceVerts(face.verts, hitPoint)) {
+      if (t < minDist) minDist = t;
+    }
+  });
+
+  return minDist;
+}
+
+// Calculate total volume of all internal braces
+function calculateBraceVolume() {
+  let totalVol = 0;
+  subdivisionEdges.forEach(edgeIdx => {
+    if (edgeIdx >= edges.length) return;
+    const [a, b] = edges[edgeIdx];
+    const va = cubeVertices[a];
+    const vb = cubeVertices[b];
+    const edgeLen = va.distanceTo(vb);
+    if (edgeLen < 0.1) return;
+
+    const adjacentFaces = [];
+    faces.forEach((face, fi) => {
+      if (face.verts.includes(a) && face.verts.includes(b)) adjacentFaces.push(fi);
+    });
+    if (adjacentFaces.length < 2) return;
+
+    const inNorm0 = getOutwardNormal(adjacentFaces[0]).negate();
+    const inNorm1 = getOutwardNormal(adjacentFaces[1]).negate();
+    const edgeDir = vb.clone().sub(va).normalize();
+    const avgInward = inNorm0.clone().add(inNorm1).normalize();
+    const braceDir = avgInward.clone().sub(edgeDir.clone().multiplyScalar(avgInward.dot(edgeDir))).normalize();
+    if (braceDir.lengthSq() < 0.01) return;
+
+    const edgeMid = va.clone().add(vb).multiplyScalar(0.5);
+    const braceDepth = calcBraceDepth(edgeMid, braceDir, edgeIdx);
+    if (braceDepth < WALL_THICKNESS * 2) return;
+    const actualDepth = braceDepth - WALL_THICKNESS;
+    if (actualDepth < 0.5) return;
+
+    totalVol += edgeLen * actualDepth * WALL_THICKNESS;
+  });
+  return totalVol;
+}
+
+// --- Front Face Cross-Hatching ---
+const crosshatchMaterial = new THREE.LineBasicMaterial({ color: 0xff8866, transparent: true, opacity: 0.45, depthTest: true });
+
+function buildCrosshatch() {
+  clearGroup(crosshatchGroup);
+
+  // Front face (index 0) — use the robust basis system for N-gon support
+  const face = faces[0];
+  const basis = getFaceBasis(0);
+  const outNormal = getOutwardNormal(0);
+  const offset = outNormal.clone().multiplyScalar(0.05);
+
+  const uLen = basis.uLen;
+  const vLen = basis.vLen;
+
+  // Helper: convert local (u,v) in [0..uLen, 0..vLen] to world 3D + offset
+  function localToWorld3D(lu, lv) {
+    const wu = basis.minU + lu;
+    const wv = basis.minV + lv;
+    return basis.uDir.clone().multiplyScalar(wu).add(basis.vDir.clone().multiplyScalar(wv)).add(offset);
+  }
+
+  // Build a 2D polygon of the face for line clipping
+  const faceVerts2D = face.verts.map(i => {
+    const p = cubeVertices[i];
+    return { u: p.dot(basis.uDir) - basis.minU, v: p.dot(basis.vDir) - basis.minV };
+  });
+
+  // Sutherland-Hodgman line-segment clip against convex/concave polygon
+  // Clips a line segment (p1,p2) to the polygon, returns clipped segments
+  function clipLineToPolygon(p1u, p1v, p2u, p2v, poly) {
+    let segments = [{ u1: p1u, v1: p1v, u2: p2u, v2: p2v }];
+    const n = poly.length;
+    for (let i = 0; i < n; i++) {
+      const eu = poly[(i+1)%n].u - poly[i].u;
+      const ev = poly[(i+1)%n].v - poly[i].v;
+      // Edge normal (inward for CCW polygon)
+      const nu = -ev, nv = eu;
+      const newSegments = [];
+      segments.forEach(seg => {
+        const d1 = nu * (seg.u1 - poly[i].u) + nv * (seg.v1 - poly[i].v);
+        const d2 = nu * (seg.u2 - poly[i].u) + nv * (seg.v2 - poly[i].v);
+        if (d1 >= -0.01 && d2 >= -0.01) {
+          newSegments.push(seg); // both inside
+        } else if (d1 >= -0.01) {
+          // p1 inside, p2 outside — clip p2
+          const t = d1 / (d1 - d2);
+          newSegments.push({ u1: seg.u1, v1: seg.v1, u2: seg.u1 + t*(seg.u2-seg.u1), v2: seg.v1 + t*(seg.v2-seg.v1) });
+        } else if (d2 >= -0.01) {
+          // p2 inside, p1 outside — clip p1
+          const t = d1 / (d1 - d2);
+          newSegments.push({ u1: seg.u1 + t*(seg.u2-seg.u1), v1: seg.v1 + t*(seg.v2-seg.v1), u2: seg.u2, v2: seg.v2 });
+        }
+        // else both outside — discard
+      });
+      segments = newSegments;
+      if (segments.length === 0) break;
+    }
+    return segments;
+  }
+
+  // Check polygon winding — ensure it's CCW for clipping
+  let windingSum = 0;
+  for (let i = 0; i < faceVerts2D.length; i++) {
+    const curr = faceVerts2D[i];
+    const next = faceVerts2D[(i+1)%faceVerts2D.length];
+    windingSum += (next.u - curr.u) * (next.v + curr.v);
+  }
+  const clipPoly = windingSum > 0 ? [...faceVerts2D].reverse() : faceVerts2D;
+
+  const spacing = 1.2;
+  const numU = Math.ceil(uLen / spacing);
+  const numV = Math.ceil(vLen / spacing);
+
+  // Diagonal set 1
+  for (let i = 1; i < numU + numV; i++) {
+    const t = i * spacing;
+    let startU, startV, endU, endV;
+    if (t <= uLen) { startU = t; startV = 0; }
+    else { startU = uLen; startV = t - uLen; }
+    if (t <= vLen) { endU = 0; endV = t; }
+    else { endU = t - vLen; endV = vLen; }
+    if (startU < endU || startV > endV) continue;
+    if (startU < 0 || startU > uLen || endU < 0 || endU > uLen) continue;
+    if (startV < 0 || startV > vLen || endV < 0 || endV > vLen) continue;
+    const clipped = clipLineToPolygon(startU, startV, endU, endV, clipPoly);
+    clipped.forEach((seg, si) => {
+      const p1 = localToWorld3D(seg.u1, seg.v1);
+      const p2 = localToWorld3D(seg.u2, seg.v2);
+      if (p1.distanceTo(p2) < 0.1) return;
+      const geom = new THREE.BufferGeometry().setFromPoints([p1, p2]);
+      const line = new THREE.Line(geom, crosshatchMaterial);
+      line.name = `crosshatch_a_${i}_${si}`;
+      crosshatchGroup.add(line);
+    });
+  }
+
+  // Diagonal set 2
+  for (let i = 1; i < numU + numV; i++) {
+    const t = i * spacing;
+    let startU, startV, endU, endV;
+    if (t <= uLen) { startU = uLen - t; startV = 0; }
+    else { startU = 0; startV = t - uLen; }
+    if (t <= vLen) { endU = uLen; endV = t; }
+    else { endU = uLen - (t - vLen); endV = vLen; }
+    if (startU > endU || startV > endV) continue;
+    if (startU < 0 || startU > uLen || endU < 0 || endU > uLen) continue;
+    if (startV < 0 || startV > vLen || endV < 0 || endV > vLen) continue;
+    const clipped = clipLineToPolygon(startU, startV, endU, endV, clipPoly);
+    clipped.forEach((seg, si) => {
+      const p1 = localToWorld3D(seg.u1, seg.v1);
+      const p2 = localToWorld3D(seg.u2, seg.v2);
+      if (p1.distanceTo(p2) < 0.1) return;
+      const geom = new THREE.BufferGeometry().setFromPoints([p1, p2]);
+      const line = new THREE.Line(geom, crosshatchMaterial);
+      line.name = `crosshatch_b_${i}_${si}`;
+      crosshatchGroup.add(line);
+    });
+  }
+
+  // FRONT label
+  const frontVerts = face.verts.map(i => cubeVertices[i]);
+  const faceCenter = new THREE.Vector3();
+  frontVerts.forEach(vv => faceCenter.add(vv));
+  faceCenter.divideScalar(frontVerts.length);
+  const labelPos = faceCenter.clone().add(outNormal.clone().multiplyScalar(0.15));
+  const canvas = document.createElement("canvas");
+  canvas.width = 256; canvas.height = 80;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(8, 8, 240, 64, 12); else ctx.rect(8, 8, 240, 64);
+  ctx.fill();
+  ctx.fillStyle = "#ff8866";
+  ctx.font = "bold 36px Arial";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("FRONT", 128, 42);
+  const texture = new THREE.CanvasTexture(canvas);
+  const spriteMat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+  const sprite = new THREE.Sprite(spriteMat);
+  sprite.position.copy(labelPos);
+  sprite.scale.set(4.5, 1.5, 1);
+  sprite.name = 'crosshatch_label';
+  crosshatchGroup.add(sprite);
+
+  // Other face labels - dynamic for all faces including subdivided ones
+  const baseColors = ["#88aacc", "#88ccaa", "#ccaa88", "#aa88cc", "#cc8888", "#88cccc", "#cccc88", "#cc88cc", "#aabb88", "#88aaaa"];
+  const faceLabelConfig = [];
+  for (let i = 1; i < faces.length; i++) {
+    faceLabelConfig.push({
+      faceIdx: i,
+      text: faces[i].name.toUpperCase(),
+      color: baseColors[(i - 1) % baseColors.length],
+    });
+  }
+
+  faceLabelConfig.forEach(cfg => {
+    if (cfg.faceIdx >= faces.length) return;
+    const f = faces[cfg.faceIdx];
+    const fv = f.verts.map(i => cubeVertices[i]);
+    const fc = new THREE.Vector3();
+    fv.forEach(vv => fc.add(vv));
+    fc.divideScalar(fv.length);
+    const fn = getOutwardNormal(cfg.faceIdx);
+    const lp = fc.clone().add(fn.clone().multiplyScalar(0.12));
+
+    const lCanvas = document.createElement("canvas");
+    lCanvas.width = 256; lCanvas.height = 64;
+    const lCtx = lCanvas.getContext("2d");
+    lCtx.fillStyle = "rgba(0,0,0,0.35)";
+    lCtx.beginPath();
+    if (lCtx.roundRect) lCtx.roundRect(16, 8, 224, 48, 10);
+    else lCtx.rect(16, 8, 224, 48);
+    lCtx.fill();
+    lCtx.strokeStyle = cfg.color + "44";
+    lCtx.lineWidth = 1.5;
+    lCtx.beginPath();
+    if (lCtx.roundRect) lCtx.roundRect(16, 8, 224, 48, 10);
+    else lCtx.rect(16, 8, 224, 48);
+    lCtx.stroke();
+    lCtx.fillStyle = cfg.color;
+    lCtx.globalAlpha = 0.7;
+    lCtx.font = "bold 26px Arial";
+    lCtx.textAlign = "center";
+    lCtx.textBaseline = "middle";
+    lCtx.fillText(cfg.text, 128, 34);
+
+    const lTexture = new THREE.CanvasTexture(lCanvas);
+    const lSpriteMat = new THREE.SpriteMaterial({
+      map: lTexture, transparent: true, depthTest: false, opacity: 0.75,
+    });
+    const lSprite = new THREE.Sprite(lSpriteMat);
+    lSprite.position.copy(lp);
+    lSprite.scale.set(3.5, 1.0, 1);
+    lSprite.name = `faceLabel_${cfg.faceIdx}`;
+    crosshatchGroup.add(lSprite);
+  });
+}
+
+// --- Port Visuals ---
+let portDragHandles = [];
+
+function buildPortVisuals() {
+  clearGroup(portGroup);
+  portDragHandles = [];
+
+  ports.forEach((port, pi) => {
+    const worldPos = faceUVToWorld(port.faceIndex, port.u, port.v);
+    const outNormal = getOutwardNormal(port.faceIndex);
+    const inNormal = outNormal.clone().negate();
+    const radius = port.diameter / 2;
+
+    if (port.type === 'bassreflex') {
+      const holeGeom = new THREE.CircleGeometry(radius, 48);
+      const hole = new THREE.Mesh(holeGeom, portHoleMaterial);
+      hole.position.copy(worldPos).addScaledVector(outNormal, 0.05);
+      hole.lookAt(worldPos.clone().add(outNormal));
+      hole.name = `portHole_${pi}`;
+      portGroup.add(hole);
+
+      const ringGeom = new THREE.RingGeometry(radius, radius + 0.35, 48);
+      const ring = new THREE.Mesh(ringGeom, portRingMaterial.clone());
+      ring.position.copy(worldPos).addScaledVector(outNormal, 0.08);
+      ring.lookAt(worldPos.clone().add(outNormal));
+      ring.name = `portRing_${pi}`;
+      portGroup.add(ring);
+
+      const tubeLen = port.tubeLength || DEFAULT_PORT_LENGTH;
+      const tubeGeom = new THREE.CylinderGeometry(radius, radius, tubeLen, 48, 1, true);
+      const tube = new THREE.Mesh(tubeGeom, portTubeMaterial.clone());
+      const tubeCenter = worldPos.clone().addScaledVector(inNormal, tubeLen / 2);
+      tube.position.copy(tubeCenter);
+      const up = new THREE.Vector3(0, 1, 0);
+      const quat = new THREE.Quaternion().setFromUnitVectors(up, inNormal);
+      tube.setRotationFromQuaternion(quat);
+      tube.name = `portTube_${pi}`;
+      portGroup.add(tube);
+
+      const capRingGeom = new THREE.RingGeometry(radius - 0.15, radius, 48);
+      const capRing = new THREE.Mesh(capRingGeom, portRingMaterial.clone());
+      const capPos = worldPos.clone().addScaledVector(inNormal, tubeLen);
+      capRing.position.copy(capPos);
+      capRing.lookAt(capPos.clone().add(inNormal));
+      capRing.name = `portCap_${pi}`;
+      portGroup.add(capRing);
+
+      const glowGeom = new THREE.RingGeometry(radius + 0.35, radius + 0.55, 48);
+      const glowMat = new THREE.MeshBasicMaterial({
+        color: 0x44aaff, transparent: true, opacity: 0.35, side: THREE.DoubleSide,
+      });
+      const glow = new THREE.Mesh(glowGeom, glowMat);
+      glow.position.copy(worldPos).addScaledVector(outNormal, 0.06);
+      glow.lookAt(worldPos.clone().add(outNormal));
+      glow.name = `portGlow_${pi}`;
+      portGroup.add(glow);
+
+    } else {
+      const holeGeom = new THREE.CircleGeometry(radius, 48);
+      const hole = new THREE.Mesh(holeGeom, portHoleMaterial);
+      hole.position.copy(worldPos).addScaledVector(outNormal, 0.03);
+      hole.lookAt(worldPos.clone().add(outNormal));
+      hole.name = `spkHole_${pi}`;
+      portGroup.add(hole);
+
+      const surroundGeom = new THREE.RingGeometry(radius * 0.82, radius, 48);
+      const surround = new THREE.Mesh(surroundGeom, speakerSurroundMaterial.clone());
+      surround.position.copy(worldPos).addScaledVector(outNormal, 0.12);
+      surround.lookAt(worldPos.clone().add(outNormal));
+      surround.name = `spkSurround_${pi}`;
+      portGroup.add(surround);
+
+      const coneGeom = new THREE.CircleGeometry(radius * 0.8, 48);
+      const cone = new THREE.Mesh(coneGeom, speakerConeMaterial.clone());
+      cone.position.copy(worldPos).addScaledVector(outNormal, 0.08);
+      cone.lookAt(worldPos.clone().add(outNormal));
+      cone.name = `spkCone_${pi}`;
+      portGroup.add(cone);
+
+      const dustGeom = new THREE.CircleGeometry(radius * 0.28, 48);
+      const dust = new THREE.Mesh(dustGeom, speakerDustcapMaterial.clone());
+      dust.position.copy(worldPos).addScaledVector(outNormal, 0.16);
+      dust.lookAt(worldPos.clone().add(outNormal));
+      dust.name = `spkDust_${pi}`;
+      portGroup.add(dust);
+
+      const mountGeom = new THREE.RingGeometry(radius, radius + 0.4, 48);
+      const mount = new THREE.Mesh(mountGeom, portRingMaterial.clone());
+      mount.position.copy(worldPos).addScaledVector(outNormal, 0.1);
+      mount.lookAt(worldPos.clone().add(outNormal));
+      mount.name = `spkMount_${pi}`;
+      portGroup.add(mount);
+
+      const magnetLen = port.tubeLength || DEFAULT_PORT_LENGTH;
+      const magnetRadius = radius * 0.45;
+      const magnetGeom = new THREE.CylinderGeometry(magnetRadius, magnetRadius, magnetLen, 32, 1, false);
+      const magnetMat = new THREE.MeshPhysicalMaterial({
+        color: 0x555555, roughness: 0.5, metalness: 0.7, side: THREE.DoubleSide,
+      });
+      const magnet = new THREE.Mesh(magnetGeom, magnetMat);
+      const magCenter = worldPos.clone().addScaledVector(inNormal, magnetLen / 2 + 0.2);
+      magnet.position.copy(magCenter);
+      const up = new THREE.Vector3(0, 1, 0);
+      const quat = new THREE.Quaternion().setFromUnitVectors(up, inNormal);
+      magnet.setRotationFromQuaternion(quat);
+      magnet.name = `spkMagnet_${pi}`;
+      portGroup.add(magnet);
+
+      const glowGeom = new THREE.RingGeometry(radius + 0.4, radius + 0.6, 48);
+      const glowMat = new THREE.MeshBasicMaterial({
+        color: 0xff8844, transparent: true, opacity: 0.35, side: THREE.DoubleSide,
+      });
+      const glow = new THREE.Mesh(glowGeom, glowMat);
+      glow.position.copy(worldPos).addScaledVector(outNormal, 0.06);
+      glow.lookAt(worldPos.clone().add(outNormal));
+      glow.name = `spkGlow_${pi}`;
+      portGroup.add(glow);
+    }
+
+    // Drag handle
+    const dragHandleGeom = new THREE.SphereGeometry(0.45, 16, 16);
+    const dragHandleMat = new THREE.MeshPhysicalMaterial({
+      color: port.type === 'bassreflex' ? 0x44aaff : 0xff8844,
+      emissive: port.type === 'bassreflex' ? 0x113355 : 0x553311,
+      roughness: 0.2, metalness: 0.8, transparent: true, opacity: 0.7,
+    });
+    const dragHandle = new THREE.Mesh(dragHandleGeom, dragHandleMat);
+    dragHandle.position.copy(worldPos).addScaledVector(outNormal, 0.4);
+    dragHandle.userData.portIndex = pi;
+    dragHandle.name = `portDragHandle_${pi}`;
+    portGroup.add(dragHandle);
+    portDragHandles.push(dragHandle);
+
+    // Label
+    const canvas = document.createElement("canvas");
+    canvas.width = 200; canvas.height = 52;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "rgba(0,0,0,0.78)";
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(2, 2, 196, 48, 8); else ctx.rect(2, 2, 196, 48);
+    ctx.fill();
+    ctx.fillStyle = port.type === 'bassreflex' ? "#44aaff" : "#ff8844";
+    ctx.font = "bold 18px Arial";
+    ctx.textAlign = "center";
+    const lbl = port.type === 'bassreflex' ? `⌀${port.diameter}" Port` : `⌀${port.diameter}" Spkr`;
+    ctx.fillText(lbl, 100, 32);
+    const tex = new THREE.CanvasTexture(canvas);
+    const sMat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+    const spr = new THREE.Sprite(sMat);
+    spr.position.copy(worldPos).addScaledVector(outNormal, 2);
+    spr.scale.set(3.8, 1.2, 1);
+    spr.name = `portLabel_${pi}`;
+    portGroup.add(spr);
+  });
+}
+
+// --- Volume / Area Calc ---
+function signedVolumeOfTriangle(p1, p2, p3) {
+  return p1.dot(p2.clone().cross(p3)) / 6.0;
+}
+
+function calculateOuterVolume() {
+  let vol = 0;
+  faces.forEach((face, fi) => {
+    const v = face.verts.map(i => cubeVertices[i]);
+    const normal = getFaceNormal(fi);
+    const tris = triangulateFace(v, normal);
+    tris.forEach(([a, b, c]) => {
+      vol += signedVolumeOfTriangle(v[a], v[b], v[c]);
+    });
+  });
+  return Math.abs(vol);
+}
+
+function calculateInnerVolume() {
+  const innerVerts = cubeVertices.map((v, i) => {
+    const normals = [];
+    faces.forEach((face, fi) => {
+      if (face.verts.includes(i)) {
+        normals.push(getFaceNormal(fi).clone());
+      }
+    });
+    const avgNormal = new THREE.Vector3();
+    normals.forEach(n => avgNormal.add(n));
+    avgNormal.normalize();
+    const center = new THREE.Vector3();
+    cubeVertices.forEach(cv => center.add(cv));
+    center.divideScalar(cubeVertices.length);
+    if (avgNormal.dot(center.clone().sub(v).normalize()) < 0) avgNormal.negate();
+    return v.clone().add(avgNormal.multiplyScalar(WALL_THICKNESS));
+  });
+  let vol = 0;
+  faces.forEach((face, fi) => {
+    const v = face.verts.map(i => innerVerts[i]);
+    const normal = getFaceNormal(fi);
+    const tris = triangulateFace(v, normal);
+    tris.forEach(([a, b, c]) => {
+      vol += signedVolumeOfTriangle(v[a], v[b], v[c]);
+    });
+  });
+  return Math.abs(vol);
+}
+
+function calculatePortDisplacement() {
+  let totalDisp = 0;
+  ports.forEach(p => {
+    const r = p.diameter / 2;
+    const tubeLen = p.tubeLength || DEFAULT_PORT_LENGTH;
+    if (p.type === 'bassreflex') {
+      totalDisp += Math.PI * r * r * tubeLen;
+    } else {
+      const magR = r * 0.45;
+      totalDisp += Math.PI * magR * magR * tubeLen;
+    }
+  });
+  return totalDisp;
+}
+
+function getNetInternalVolume() {
+  return Math.max(0, calculateInnerVolume() - calculatePortDisplacement() - calculateBraceVolume());
+}
+
+function calculateFaceArea(faceVerts) {
+  let area = 0;
+  for (let i = 1; i < faceVerts.length - 1; i++) {
+    const cross = faceVerts[i].clone().sub(faceVerts[0]).cross(faceVerts[i+1].clone().sub(faceVerts[0]));
+    area += cross.length() / 2;
+  }
+  return area;
+}
+
+// --- Thiele-Small Calculations ---
+function calcTuningFrequency() {
+  const c = 13504;
+  const netVol = getNetInternalVolume();
+  if (netVol <= 0) return null;
+  let totalPortArea = 0;
+  let hasPort = false;
+  ports.forEach(p => {
+    if (p.type === 'bassreflex') {
+      totalPortArea += Math.PI * Math.pow(p.diameter / 2, 2);
+      hasPort = true;
+    }
+  });
+  if (!hasPort) return null;
+  const avgPortLen = ports.filter(p => p.type === 'bassreflex')
+    .reduce((s, p) => s + (p.tubeLength || DEFAULT_PORT_LENGTH), 0)
+    / ports.filter(p => p.type === 'bassreflex').length;
+  const Leff = avgPortLen + 0.825 * Math.sqrt(totalPortArea);
+  if (Leff <= 0) return null;
+  const fb = (c / (2 * Math.PI)) * Math.sqrt(totalPortArea / (netVol * Leff));
+  return fb;
+}
+
+function calcIdealPortLength(targetFb) {
+  const c = 13504;
+  const netVol = getNetInternalVolume();
+  if (netVol <= 0 || targetFb <= 0) return null;
+  let totalPortArea = 0;
+  let hasPort = false;
+  ports.forEach(p => {
+    if (p.type === 'bassreflex') {
+      totalPortArea += Math.PI * Math.pow(p.diameter / 2, 2);
+      hasPort = true;
+    }
+  });
+  if (!hasPort || totalPortArea <= 0) return null;
+  const Leff = (totalPortArea * c * c) / (4 * Math.PI * Math.PI * targetFb * targetFb * netVol);
+  const correction = 0.825 * Math.sqrt(totalPortArea);
+  const portLen = Leff - correction;
+  return portLen > 0.5 ? portLen : null;
+}
+
+function calcRecommendedVolume() {
+  const sealedVb = tsParams.vas * Math.pow(tsParams.qts, 2.87);
+  const portedVb = 15 * tsParams.vas * Math.pow(tsParams.qts, 3.3);
+  return {
+    sealed: sealedVb * 16.387,
+    ported: portedVb * 16.387,
+    sealedL: sealedVb,
+    portedL: portedVb,
+  };
+}
+
+function calcTargetF3() {
+  return tsParams.fs * 0.9;
+}
+
+function isPortLengthOutOfRange(length) {
+  return length < 3 || length > 10;
+}
+
+function refreshAllUI() {
+  updateThicknessPanel();
+  updateSymToggle();
+  updateStats();
+  updatePortPanel();
+  updateTSPanel();
+  updateDimensionLabels();
+  buildCrosshatch();
+  updateUnitToggle();
+  updateSplitInfo();
+  updateSubdivideUI();
+  updateHeaderBar();
+}
+
+// --- Dimension Labels ---
+function updateDimensionLabels() {
+  clearGroup(dimensionGroup);
+  edges.forEach(([a, b]) => {
+    const midPoint = cubeVertices[a].clone().add(cubeVertices[b]).multiplyScalar(0.5);
+    const len = cubeVertices[a].distanceTo(cubeVertices[b]);
+    const label = fmtLen(len);
+    const canvas = document.createElement("canvas");
+    canvas.width = 160; canvas.height = 48;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "rgba(0,0,0,0.7)";
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(4, 4, 152, 40, 8); else ctx.rect(4, 4, 152, 40);
+    ctx.fill();
+    ctx.fillStyle = "#ffcc44";
+    ctx.font = "bold 20px Arial";
+    ctx.textAlign = "center";
+    ctx.fillText(label, 80, 32);
+    const texture = new THREE.CanvasTexture(canvas);
+    const spriteMat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+    const sprite = new THREE.Sprite(spriteMat);
+    sprite.position.copy(midPoint);
+    sprite.scale.set(3.5, 1.2, 1);
+    dimensionGroup.add(sprite);
+  });
+}
+
+// --- Update All ---
+function updateAll() {
+  createHandles();
+  buildEnclosure();
+  updateStats();
+  updateDimensionLabels();
+  updatePortPanel();
+  updateSplitInfo();
+  updateSubdivideUI();
+}
+
+// =============== SWIPE GESTURE SYSTEM ===============
+const SWIPE_THRESHOLD = 40; // minimum px distance to trigger swipe
+const SWIPE_MAX_HORIZONTAL = 80; // max horizontal drift allowed
+
+function addSwipeGesture(panel, { onSwipeUp, onSwipeDown }) {
+  let startY = null, startX = null, startTime = 0;
+  let tracking = false;
+
+  panel.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) return;
+    // Don't interfere with inputs, selects, buttons
+    const tag = e.target.tagName;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'BUTTON') return;
+    startY = e.touches[0].clientY;
+    startX = e.touches[0].clientX;
+    startTime = Date.now();
+    tracking = true;
+  }, { passive: true });
+
+  panel.addEventListener('touchmove', (e) => {
+    // passive — just track
+  }, { passive: true });
+
+  panel.addEventListener('touchend', (e) => {
+    if (!tracking || startY === null) { tracking = false; return; }
+    const elapsed = Date.now() - startTime;
+    if (elapsed > 600) { tracking = false; startY = null; return; } // too slow
+
+    let endY, endX;
+    if (e.changedTouches && e.changedTouches.length > 0) {
+      endY = e.changedTouches[0].clientY;
+      endX = e.changedTouches[0].clientX;
+    } else {
+      tracking = false; startY = null; return;
+    }
+
+    const dy = endY - startY;
+    const dx = Math.abs(endX - startX);
+    tracking = false;
+    startY = null;
+
+    // Must be primarily vertical
+    if (dx > SWIPE_MAX_HORIZONTAL) return;
+
+    if (dy > SWIPE_THRESHOLD && onSwipeDown) {
+      onSwipeDown();
+    } else if (dy < -SWIPE_THRESHOLD && onSwipeUp) {
+      onSwipeUp();
+    }
+  }, { passive: true });
+
+  panel.addEventListener('touchcancel', () => { tracking = false; startY = null; });
+}
+
+// Reusable drag-handle indicator HTML for panel headers
+function swipeHandleHTML() {
+  return `<div style="width:28px;height:3px;border-radius:2px;background:rgba(255,255,255,0.15);margin:0 auto 4px auto;"></div>`;
+}
+
+// =============== BOUNCE ANIMATION CSS ===============
+const bounceStyle = document.createElement("style");
+bounceStyle.textContent = `
+@keyframes toolbarBounce {
+  0%, 100% { transform: translateY(0); }
+  20% { transform: translateY(4px); }
+  40% { transform: translateY(-2px); }
+  60% { transform: translateY(2px); }
+  80% { transform: translateY(-1px); }
+}
+@keyframes toolbarGlow {
+  0%, 100% { box-shadow: 0 0 4px rgba(255,204,68,0.2); }
+  50% { box-shadow: 0 0 12px rgba(255,204,68,0.6), 0 0 20px rgba(255,204,68,0.3); }
+}
+.toolbar-bounce {
+  animation: toolbarBounce 1.2s ease-in-out infinite, toolbarGlow 1.8s ease-in-out infinite;
+}
+`;
+document.head.appendChild(bounceStyle);
+
+// =============== UI ===============
+const uiContainer = document.createElement("div");
+uiContainer.style.cssText = `position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;font-family:'Segoe UI',Arial,sans-serif;overflow:hidden;`;
+document.body.appendChild(uiContainer);
+
+// --- Top-Left Toolbar (collapsible) ---
+let toolbarExpanded = false;
+let instructionsOpen = false;
+
+const header = document.createElement("div");
+header.style.cssText = `position:fixed;top:8px;left:8px;pointer-events:auto;z-index:10;display:flex;flex-direction:column;gap:6px;max-width:260px;`;
+uiContainer.appendChild(header);
+
+// Header bar (always visible)
+const headerBar = document.createElement("div");
+headerBar.style.cssText = `background:rgba(10,10,30,0.88);backdrop-filter:blur(12px);padding:8px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);display:flex;align-items:center;gap:8px;`;
+header.appendChild(headerBar);
+
+// The collapsible toolbar panels container
+const toolbarPanels = document.createElement("div");
+toolbarPanels.style.cssText = `display:flex;flex-direction:column;gap:5px;overflow:hidden;transition:max-height 0.35s ease, opacity 0.25s ease;max-height:0;opacity:0;`;
+header.appendChild(toolbarPanels);
+
+// Instructions overlay
+const instructionsOverlay = document.createElement("div");
+instructionsOverlay.style.cssText = `position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(5,5,20,0.92);backdrop-filter:blur(16px);z-index:100;pointer-events:auto;display:none;overflow-y:auto;-webkit-overflow-scrolling:touch;`;
+uiContainer.appendChild(instructionsOverlay);
+
+function updateHeaderBar() {
+  headerBar.innerHTML = `
+    <div id="toolbarToggleBtn" class="${!toolbarEverOpened ? 'toolbar-bounce' : ''}" style="width:36px;height:36px;border-radius:8px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;transition:all 0.2s;" title="Settings">
+      <span style="font-size:14px;color:#ffcc44;transition:transform 0.3s;display:inline-block;${toolbarExpanded ? 'transform:rotate(180deg);' : ''}">${toolbarExpanded ? '▲' : '▼'}</span>
+    </div>
+    <div style="width:34px;height:34px;background:linear-gradient(135deg,#ff8844,#ff4488);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:17px;flex-shrink:0;">🔊</div>
+    <div style="flex:1;min-width:0;">
+      <div style="font-size:13px;font-weight:700;color:#fff;">Speaker Enclosure</div>
+      <div style="font-size:9px;color:#88aacc;margin-top:1px;">${useMetric ? 'Metric' : fmtThickness(WALL_THICKNESS) + ' walls'} · ${symmetrical ? 'SYM' : 'ASYM'}</div>
+    </div>
+    <div id="instructionsBtn" style="width:36px;height:36px;border-radius:8px;background:rgba(170,136,255,0.2);border:1px solid rgba(170,136,255,0.35);display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;transition:all 0.2s;" title="Instructions">
+      <span style="font-size:15px;color:#aa88ff;">?</span>
+    </div>
+  `;
+
+  const toggleBtn = document.getElementById('toolbarToggleBtn');
+  if (toggleBtn) {
+    const h = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      toolbarEverOpened = true;
+      try { localStorage.setItem('speakerEnclosure_toolbarOpened', '1'); } catch(ex) {}
+      toolbarExpanded = !toolbarExpanded;
+      if (toolbarExpanded) {
+        toolbarPanels.style.maxHeight = '500px';
+        toolbarPanels.style.opacity = '1';
+      } else {
+        toolbarPanels.style.maxHeight = '0';
+        toolbarPanels.style.opacity = '0';
+      }
+      updateHeaderBar();
+    };
+    toggleBtn.addEventListener('click', h);
+    toggleBtn.addEventListener('touchend', h);
+  }
+
+  const instrBtn = document.getElementById('instructionsBtn');
+  if (instrBtn) {
+    const h = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      instructionsOpen = !instructionsOpen;
+      instructionsOverlay.style.display = instructionsOpen ? 'block' : 'none';
+    };
+    instrBtn.addEventListener('click', h);
+    instrBtn.addEventListener('touchend', h);
+  }
+}
+
+function buildInstructionsOverlay() {
+  instructionsOverlay.innerHTML = `
+    <div style="max-width:520px;margin:0 auto;padding:24px 20px 40px 20px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">
+        <div style="font-size:18px;font-weight:700;color:#fff;">📖 Instructions</div>
+        <div id="closeInstructionsBtn" style="width:34px;height:34px;border-radius:8px;background:rgba(255,68,102,0.2);border:1px solid rgba(255,68,102,0.4);display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:16px;color:#ff4466;">✕</div>
+      </div>
+
+      <div style="font-size:13px;color:#ccddee;line-height:1.7;">
+
+        <div style="background:rgba(255,204,68,0.08);border:1px solid rgba(255,204,68,0.2);border-radius:10px;padding:12px;margin-bottom:14px;">
+          <div style="font-size:12px;font-weight:700;color:#ffcc44;margin-bottom:6px;">🔵 Drag Corner Handles</div>
+          <div style="color:#aabbcc;font-size:11px;">Click and drag the <span style="color:#00ccff;">blue spheres</span> at each corner to reshape the enclosure. Vertices snap to a 0.1" grid. The floor (Y=0) acts as a boundary — corners cannot go below ground level.</div>
+        </div>
+
+        <div style="background:rgba(255,100,255,0.08);border:1px solid rgba(255,100,255,0.2);border-radius:10px;padding:12px;margin-bottom:14px;">
+          <div style="font-size:12px;font-weight:700;color:#ff88ff;margin-bottom:6px;">✂ Split Edges</div>
+          <div style="color:#aabbcc;font-size:11px;">Click on any <span style="color:#ffcc44;">gold edge line</span> to split it into two segments. A new <span style="color:#ff44ff;">magenta handle</span> appears at the split point, giving you extra control points to create more complex shapes. The cursor changes to a crosshair when hovering a splittable edge.</div>
+        </div>
+
+        <div style="background:rgba(68,255,68,0.08);border:1px solid rgba(68,255,68,0.2);border-radius:10px;padding:12px;margin-bottom:14px;">
+          <div style="font-size:12px;font-weight:700;color:#44ff44;margin-bottom:6px;">✂ Subdivide Face</div>
+          <div style="color:#aabbcc;font-size:11px;">Open the <span style="color:#ffcc44;">▼ settings menu</span> and enable <span style="color:#44ff44;">Subdivide Face</span> mode. Click any vertex on a face with 4+ sides as the starting point. Non-adjacent vertices on the same face highlight in <span style="color:#ffff44;">yellow</span> — click one to split the face into two separate panels along a new edge. Great for creating internal braces, dividers, or multi-chamber designs. A green preview line shows the cut before you confirm.</div>
+        </div>
+
+        <div style="background:rgba(68,255,170,0.08);border:1px solid rgba(68,255,170,0.2);border-radius:10px;padding:12px;margin-bottom:14px;">
+          <div style="font-size:12px;font-weight:700;color:#44ffaa;margin-bottom:6px;">⚖ Symmetry Mode</div>
+          <div style="color:#aabbcc;font-size:11px;">When <span style="color:#44ffaa;">SYM</span> is enabled, moving one corner automatically mirrors the change to the opposite corners, keeping the enclosure symmetrical. Toggle it off for asymmetric designs.</div>
+        </div>
+
+        <div style="background:rgba(68,170,255,0.08);border:1px solid rgba(68,170,255,0.2);border-radius:10px;padding:12px;margin-bottom:14px;">
+          <div style="font-size:12px;font-weight:700;color:#44aaff;margin-bottom:6px;">🎵 Add Ports & Speakers</div>
+          <div style="color:#aabbcc;font-size:11px;">Use the <span style="color:#ff6688;">Speaker / Ports</span> panel (bottom-left) to place bass reflex ports or speaker drivers on any face. Choose the type, diameter, and target face, then click "Add". Drag the colored handle on the 3D model to reposition. Each port has a tube length you can adjust — it shows <span style="color:#ff3333;">red</span> if outside the 3–10" recommended range.</div>
+        </div>
+
+        <div style="background:rgba(170,136,255,0.08);border:1px solid rgba(170,136,255,0.2);border-radius:10px;padding:12px;margin-bottom:14px;">
+          <div style="font-size:12px;font-weight:700;color:#aa88ff;margin-bottom:6px;">🎛 Thiele-Small Parameters</div>
+          <div style="color:#aabbcc;font-size:11px;">Open the <span style="color:#aa88ff;">Thiele-Small</span> panel (bottom-right) to enter your driver's Fs, Qts, and Vas values. The app calculates recommended sealed/ported volumes, target f3, ideal port length, and current tuning frequency (Fb). You can manually override Fb or tube length — editing one auto-recalculates the other. The <span style="color:#44ffaa;">► Ideal</span> button sets port length to the calculated optimum.</div>
+        </div>
+
+        <div style="background:rgba(255,136,68,0.08);border:1px solid rgba(255,136,68,0.2);border-radius:10px;padding:12px;margin-bottom:14px;">
+          <div style="font-size:12px;font-weight:700;color:#ff8844;margin-bottom:6px;">🪵 Material Thickness</div>
+          <div style="color:#aabbcc;font-size:11px;">Choose the wall material thickness (½", ¾", 1", or 1½") from the settings dropdown. This affects the calculated internal volume — thicker walls reduce the usable interior space.</div>
+        </div>
+
+        <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:12px;margin-bottom:14px;">
+          <div style="font-size:12px;font-weight:700;color:#fff;margin-bottom:6px;">📏 Units & Display</div>
+          <div style="color:#aabbcc;font-size:11px;">Switch between <span style="color:#ffcc44;">Imperial</span> (inches, ft³) and <span style="color:#44ccff;">Metric</span> (cm, Liters) modes. All dimensions, areas, and volumes update throughout the entire app. Edge labels on the 3D model show live dimensions.</div>
+        </div>
+
+        <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:12px;margin-bottom:14px;">
+          <div style="font-size:12px;font-weight:700;color:#fff;margin-bottom:6px;">🖱 Camera Controls</div>
+          <div style="color:#aabbcc;font-size:11px;">
+            <strong style="color:#88aacc;">Rotate:</strong> Click & drag (or one-finger drag on mobile)<br>
+            <strong style="color:#88aacc;">Zoom:</strong> Scroll wheel (or pinch on mobile)<br>
+            <strong style="color:#88aacc;">Pan:</strong> Right-click & drag (or two-finger drag on mobile)<br>
+            The <span style="color:#ff8866;">FRONT</span> face has crosshatch markings for orientation. Other faces show subtle labels (BACK, LEFT, RIGHT, TOP, BOTTOM).
+          </div>
+        </div>
+
+        <div style="background:rgba(255,204,68,0.08);border:1px solid rgba(255,204,68,0.2);border-radius:10px;padding:12px;margin-bottom:14px;">
+          <div style="font-size:12px;font-weight:700;color:#ffcc44;margin-bottom:6px;">↩ Undo / Redo / Reset / Clear</div>
+          <div style="color:#aabbcc;font-size:11px;">Open the <span style="color:#ffcc44;">▼ settings menu</span> (top-left) to find <span style="color:#ffcc44;">Undo</span>, <span style="color:#44ccff;">Redo</span>, <span style="color:#ff4466;">Reset</span>, and <span style="color:#ff6688;">Clear</span> buttons. Every action (dragging, splitting, adding/removing ports, thickness changes) can be undone/redone — up to 50 steps. On desktop: <span style="color:#ffcc44;">Ctrl+Z</span> to undo, <span style="color:#44ccff;">Ctrl+Shift+Z</span> or <span style="color:#44ccff;">Ctrl+Y</span> to redo. Reset restores the default 12"×12" cube. Clear removes all ports.</div>
+        </div>
+
+        <div style="background:rgba(255,204,68,0.08);border:1px solid rgba(255,204,68,0.2);border-radius:10px;padding:12px;">
+          <div style="font-size:12px;font-weight:700;color:#ffcc44;margin-bottom:6px;">📐 Stats Panel</div>
+          <div style="color:#aabbcc;font-size:11px;">The <span style="color:#ffcc44;">Enclosure Specs</span> panel (top-right) displays net internal volume (accounting for wall thickness and port displacement), bounding dimensions, panel areas, surface area, and port details. Click the header to expand/collapse.</div>
+        </div>
+
+      </div>
+
+      <div style="margin-top:20px;text-align:center;">
+        <div id="closeInstructionsBtn2" style="display:inline-block;padding:10px 30px;border-radius:10px;background:linear-gradient(135deg,#aa88ff,#6644cc);color:#fff;font-size:13px;font-weight:700;cursor:pointer;letter-spacing:0.5px;">Got it!</div>
+      </div>
+    </div>
+  `;
+
+  const bindClose = (id) => {
+    const btn = instructionsOverlay.querySelector(`#${id}`);
+    if (btn) {
+      const h = (e) => {
+        e.preventDefault(); e.stopPropagation();
+        instructionsOpen = false;
+        instructionsOverlay.style.display = 'none';
+        try { localStorage.setItem('speakerEnclosure_instructionsSeen', '1'); } catch(ex) {}
+      };
+      btn.addEventListener('click', h);
+      btn.addEventListener('touchend', h);
+    }
+  };
+  bindClose('closeInstructionsBtn');
+  bindClose('closeInstructionsBtn2');
+}
+buildInstructionsOverlay();
+
+// --- First-time auto-open instructions ---
+try {
+  const hasSeenInstructions = localStorage.getItem('speakerEnclosure_instructionsSeen');
+  if (!hasSeenInstructions) {
+    instructionsOpen = true;
+    instructionsOverlay.style.display = 'block';
+    localStorage.setItem('speakerEnclosure_instructionsSeen', '1');
+  }
+  // Check if toolbar has been opened before
+  const hasOpenedToolbar = localStorage.getItem('speakerEnclosure_toolbarOpened');
+  if (hasOpenedToolbar) {
+    toolbarEverOpened = true;
+  }
+} catch (e) {
+  // localStorage not available (e.g. private browsing), skip
+}
+
+// --- Collapsible panels inside toolbar dropdown ---
+
+// Material Thickness Panel
+const thicknessPanel = document.createElement("div");
+thicknessPanel.style.cssText = `background:rgba(10,10,30,0.9);backdrop-filter:blur(12px);padding:8px 12px;border-radius:10px;border:1px solid rgba(255,255,255,0.08);color:#fff;display:flex;align-items:center;gap:8px;flex-wrap:wrap;`;
+toolbarPanels.appendChild(thicknessPanel);
+
+const thicknessOptions = [
+  { label: '½"', labelMetric: '1.3 cm', value: 0.5 },
+  { label: '¾"', labelMetric: '1.9 cm', value: 0.75 },
+  { label: '1"', labelMetric: '2.5 cm', value: 1.0 },
+  { label: '1½"', labelMetric: '3.8 cm', value: 1.5 },
+];
+
+function updateThicknessPanel() {
+  thicknessPanel.innerHTML = `
+    <span style="font-size:10px;color:#88aacc;white-space:nowrap;">🪵 Material</span>
+    <div style="display:flex;gap:0;border-radius:8px;overflow:hidden;border:1px solid rgba(255,255,255,0.12);">
+      ${thicknessOptions.map(opt => `
+        <div class="thickBtn" data-val="${opt.value}" style="padding:6px 10px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;
+          background:${WALL_THICKNESS === opt.value ? 'rgba(255,204,68,0.25)' : 'rgba(30,30,60,0.6)'};
+          color:${WALL_THICKNESS === opt.value ? '#ffcc44' : '#667'};transition:all 0.2s;">
+          ${useMetric ? opt.labelMetric : opt.label}
+        </div>
+      `).join('')}
+    </div>
+  `;
+  thicknessPanel.querySelectorAll('.thickBtn').forEach(btn => {
+    const handler = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const val = parseFloat(btn.getAttribute('data-val'));
+      if (!isNaN(val) && val > 0) {
+        saveUndoState();
+        WALL_THICKNESS = val;
+        updateThicknessPanel();
+        updateStats();
+        updateTSPanel();
+        updateHeaderBar();
+      }
+    };
+    btn.addEventListener('click', handler);
+    btn.addEventListener('touchend', handler);
+  });
+}
+updateThicknessPanel();
+
+// Symmetry Toggle
+const symToggle = document.createElement("div");
+symToggle.style.cssText = `background:rgba(10,10,30,0.9);backdrop-filter:blur(12px);padding:8px 12px;border-radius:10px;border:1px solid rgba(255,255,255,0.08);color:#fff;display:flex;align-items:center;gap:8px;`;
+toolbarPanels.appendChild(symToggle);
+
+function updateSymToggle() {
+  symToggle.innerHTML = `
+    <span style="font-size:10px;color:#88aacc;">Symmetry</span>
+    <div id="symSwitch" style="width:42px;height:22px;border-radius:11px;cursor:pointer;background:${symmetrical ? '#44ffaa' : '#555'};position:relative;transition:background 0.2s;display:flex;align-items:center;">
+      <div style="width:18px;height:18px;border-radius:50%;background:#fff;position:absolute;left:${symmetrical ? '22px' : '2px'};transition:left 0.2s;box-shadow:0 1px 4px rgba(0,0,0,0.3);"></div>
+    </div>
+    <span style="font-size:10px;color:${symmetrical ? '#44ffaa' : '#888'};">${symmetrical ? 'SYM' : 'ASYM'}</span>
+  `;
+  const sw = document.getElementById('symSwitch');
+  if (sw) {
+    const toggleSym = (e) => { e.preventDefault(); symmetrical = !symmetrical; updateSymToggle(); updateHeaderBar(); };
+    sw.addEventListener('click', toggleSym);
+    sw.addEventListener('touchend', toggleSym);
+  }
+}
+updateSymToggle();
+
+// Unit Toggle
+const unitToggle = document.createElement("div");
+unitToggle.style.cssText = `background:rgba(10,10,30,0.9);backdrop-filter:blur(12px);padding:8px 12px;border-radius:10px;border:1px solid rgba(255,255,255,0.08);color:#fff;display:flex;align-items:center;gap:8px;`;
+toolbarPanels.appendChild(unitToggle);
+
+function updateUnitToggle() {
+  unitToggle.innerHTML = `
+    <span style="font-size:10px;color:#88aacc;">📏 Units</span>
+    <div style="display:flex;gap:0;border-radius:8px;overflow:hidden;border:1px solid rgba(255,255,255,0.12);">
+      <div id="unitImperial" style="padding:6px 10px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;
+        background:${!useMetric ? 'rgba(255,204,68,0.25)' : 'rgba(30,30,60,0.6)'};
+        color:${!useMetric ? '#ffcc44' : '#667'};transition:all 0.2s;">
+        Imperial
+      </div>
+      <div id="unitMetric" style="padding:6px 10px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;
+        background:${useMetric ? 'rgba(68,204,255,0.25)' : 'rgba(30,30,60,0.6)'};
+        color:${useMetric ? '#44ccff' : '#667'};transition:all 0.2s;">
+        Metric
+      </div>
+    </div>
+    <span style="font-size:9px;color:${useMetric ? '#44ccff' : '#ffcc44'};">${useMetric ? 'cm / L' : 'in / ft³'}</span>
+  `;
+  const impBtn = document.getElementById('unitImperial');
+  const metBtn = document.getElementById('unitMetric');
+  if (impBtn) {
+    const h = (e) => { e.preventDefault(); e.stopPropagation(); if (useMetric) { useMetric = false; refreshAllUI(); } };
+    impBtn.addEventListener('click', h);
+    impBtn.addEventListener('touchend', h);
+  }
+  if (metBtn) {
+    const h = (e) => { e.preventDefault(); e.stopPropagation(); if (!useMetric) { useMetric = true; refreshAllUI(); } };
+    metBtn.addEventListener('click', h);
+    metBtn.addEventListener('touchend', h);
+  }
+}
+updateUnitToggle();
+
+// Edge Split Info
+const splitInfo = document.createElement("div");
+splitInfo.style.cssText = `background:rgba(10,10,30,0.9);backdrop-filter:blur(12px);padding:6px 10px;border-radius:8px;border:1px solid rgba(255,100,255,0.2);color:#ff88ff;font-size:9px;max-width:240px;transition:opacity 0.3s;`;
+toolbarPanels.appendChild(splitInfo);
+
+function updateSplitInfo() {
+  const extraVerts = cubeVertices.length - 8;
+  if (extraVerts > 0) {
+    splitInfo.innerHTML = `✂ ${extraVerts} edge split${extraVerts > 1 ? 's' : ''} · ${cubeVertices.length} vertices · ${edges.length} edges · ${faces.length} faces<br><span style="color:#aa66aa;">Click an edge to add more splits</span>`;
+    splitInfo.style.opacity = '1';
+  } else {
+    splitInfo.innerHTML = `✂ Click any edge to split it<br><span style="color:#aa66aa;">Adds a new control point</span>`;
+    splitInfo.style.opacity = '0.7';
+  }
+}
+updateSplitInfo();
+
+// Subdivide Face Toggle
+const subdivPanel = document.createElement("div");
+subdivPanel.style.cssText = `background:rgba(10,10,30,0.9);backdrop-filter:blur(12px);padding:8px 12px;border-radius:10px;border:1px solid rgba(68,255,68,0.15);color:#fff;`;
+toolbarPanels.appendChild(subdivPanel);
+
+function updateSubdivideUI() {
+  // Check if any face has 4+ verts (prerequisite for subdivision)
+  const canSubdivide = faces.some(f => f.verts.length >= 4);
+
+  let statusText = '';
+  if (subdivideMode) {
+    if (subdivFirstVertex !== null) {
+      statusText = `<span style="color:#44ff44;">1st vertex selected</span> — tap a <span style="color:#ffff44;">yellow</span> vertex to complete`;
+    } else {
+      statusText = `Tap the <span style="color:#44ff44;">1st vertex</span>, then a non-adjacent vertex on the same face`;
+    }
+  }
+
+  subdivPanel.innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:${subdivideMode ? '6' : '0'}px;">
+      <span style="font-size:10px;color:#88ccaa;flex-shrink:0;">✂ Subdivide Face</span>
+      <div id="subdivSwitch" style="width:42px;height:22px;border-radius:11px;cursor:${canSubdivide ? 'pointer' : 'not-allowed'};background:${subdivideMode ? '#44ff44' : '#555'};position:relative;transition:background 0.2s;display:flex;align-items:center;opacity:${canSubdivide ? '1' : '0.4'};">
+        <div style="width:18px;height:18px;border-radius:50%;background:#fff;position:absolute;left:${subdivideMode ? '22px' : '2px'};transition:left 0.2s;box-shadow:0 1px 4px rgba(0,0,0,0.3);"></div>
+      </div>
+      <span style="font-size:10px;color:${subdivideMode ? '#44ff44' : '#888'};">${subdivideMode ? 'ON' : 'OFF'}</span>
+    </div>
+    ${subdivideMode ? `
+      <div style="font-size:9px;color:#88ccaa;line-height:1.4;padding:4px 0;">
+        ${statusText}
+      </div>
+      ${subdivFirstVertex !== null ? `
+        <div id="subdivCancelBtn" style="margin-top:4px;text-align:center;padding:5px 10px;border-radius:6px;border:1px solid rgba(255,68,68,0.3);background:rgba(255,68,68,0.1);color:#ff6666;font-size:10px;cursor:pointer;transition:all 0.2s;">
+          ✕ Cancel Selection
+        </div>
+      ` : ''}
+    ` : `
+      <div style="font-size:8px;color:#667;margin-top:2px;">Split a face into two panels by connecting two non-adjacent vertices</div>
+    `}
+  `;
+
+  const sw = document.getElementById('subdivSwitch');
+  if (sw && canSubdivide) {
+    const toggleSubdiv = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      subdivideMode = !subdivideMode;
+      if (!subdivideMode) {
+        cancelSubdivide();
+      } else {
+        subdivFirstVertex = null;
+        subdivEligibleVerts = [];
+      }
+      updateSubdivideUI();
+    };
+    sw.addEventListener('click', toggleSubdiv);
+    sw.addEventListener('touchend', toggleSubdiv);
+  }
+
+  const cancelBtn = document.getElementById('subdivCancelBtn');
+  if (cancelBtn) {
+    const h = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      subdivFirstVertex = null;
+      subdivEligibleVerts = [];
+      handles.forEach(h => {
+        const isSplit = splitVertices.has(h.userData.vertexIndex);
+        if (h.material && h.material.color) h.material.color.setHex(isSplit ? 0xff44ff : 0x00ccff);
+        if (h.material && h.material.emissive) h.material.emissive.setHex(isSplit ? 0x661166 : 0x004466);
+        h.scale.set(1, 1, 1);
+      });
+      updateSubdivideUI();
+    };
+    cancelBtn.addEventListener('click', h);
+    cancelBtn.addEventListener('touchend', h);
+  }
+}
+updateSubdivideUI();
+
+// --- Undo/Redo/Reset/Clear row inside toolbar ---
+const actionRow = document.createElement("div");
+actionRow.style.cssText = `background:rgba(10,10,30,0.9);backdrop-filter:blur(12px);padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,0.08);color:#fff;display:flex;align-items:center;gap:6px;flex-wrap:wrap;`;
+toolbarPanels.appendChild(actionRow);
+
+function updateActionRow() {
+  const undoDisabled = undoStack.length === 0;
+  const redoDisabled = redoStack.length === 0;
+  actionRow.innerHTML = `
+    <div id="undoBtnAction" style="flex:1;display:flex;align-items:center;justify-content:center;gap:4px;padding:8px 6px;border-radius:8px;background:${undoDisabled ? 'rgba(255,255,255,0.04)' : 'rgba(255,204,68,0.15)'};border:1px solid ${undoDisabled ? 'rgba(255,255,255,0.06)' : 'rgba(255,204,68,0.3)'};cursor:${undoDisabled ? 'default' : 'pointer'};opacity:${undoDisabled ? '0.35' : '1'};transition:all 0.2s;min-width:52px;" title="Undo (Ctrl+Z)">
+      <span style="font-size:15px;">↩</span>
+      <span style="font-size:10px;font-weight:600;color:#ffcc44;">Undo</span>
+    </div>
+    <div id="redoBtnAction" style="flex:1;display:flex;align-items:center;justify-content:center;gap:4px;padding:8px 6px;border-radius:8px;background:${redoDisabled ? 'rgba(255,255,255,0.04)' : 'rgba(68,204,255,0.15)'};border:1px solid ${redoDisabled ? 'rgba(255,255,255,0.06)' : 'rgba(68,204,255,0.3)'};cursor:${redoDisabled ? 'default' : 'pointer'};opacity:${redoDisabled ? '0.35' : '1'};transition:all 0.2s;min-width:52px;" title="Redo (Ctrl+Shift+Z)">
+      <span style="font-size:15px;">↪</span>
+      <span style="font-size:10px;font-weight:600;color:#44ccff;">Redo</span>
+    </div>
+    <div id="resetBtnAction" style="flex:1;display:flex;align-items:center;justify-content:center;gap:4px;padding:8px 6px;border-radius:8px;background:rgba(255,68,102,0.15);border:1px solid rgba(255,68,102,0.3);cursor:pointer;transition:all 0.2s;min-width:52px;" title="Reset to default cube">
+      <span style="font-size:13px;">⟲</span>
+      <span style="font-size:10px;font-weight:600;color:#ff4466;">Reset</span>
+    </div>
+  `;
+
+  const bindAction = (id, fn) => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); fn(); });
+      el.addEventListener('touchend', (e) => { e.preventDefault(); e.stopPropagation(); fn(); });
+    }
+  };
+  bindAction('undoBtnAction', undo);
+  bindAction('redoBtnAction', redo);
+  bindAction('resetBtnAction', resetCube);
+}
+
+// Initialize header bar
+updateHeaderBar();
+
+// --- Stats Panel ---
+const statsPanel = document.createElement("div");
+statsPanel.style.cssText = `position:fixed;top:8px;right:8px;pointer-events:auto;background:rgba(10,10,30,0.9);backdrop-filter:blur(12px);padding:12px 14px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);min-width:210px;max-width:250px;color:#fff;z-index:10;max-height:calc(100vh - 16px);overflow-y:auto;-webkit-overflow-scrolling:touch;`;
+uiContainer.appendChild(statsPanel);
+
+function updateStats() {
+  const outerVol = calculateOuterVolume();
+  const rawInner = calculateInnerVolume();
+  const portDisp = calculatePortDisplacement();
+  const netInner = getNetInternalVolume();
+  const min_v = new THREE.Vector3(Infinity, Infinity, Infinity);
+  const max_v = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+  cubeVertices.forEach(v => { min_v.min(v); max_v.max(v); });
+  const dims = max_v.clone().sub(min_v);
+  const faceData = faces.map(face => {
+    const v = face.verts.map(i => cubeVertices[i]);
+    return { name: face.name, area: calculateFaceArea(v) };
+  });
+  const totalSurfaceArea = faceData.reduce((s, f) => s + f.area, 0);
+
+  const volPrimary = useMetric
+    ? `${(netInner * CUIN_TO_LITERS).toFixed(2)}`
+    : `${netInner.toFixed(1)}`;
+  const volPrimaryUnit = useMetric ? 'L' : 'in³';
+  const volLarge = useMetric
+    ? `${(netInner * CUIN_TO_LITERS).toFixed(2)} <span style="font-size:9px;color:#ccaa88;">L</span>`
+    : `${(netInner * CUIN_TO_CUFT).toFixed(3)} <span style="font-size:9px;color:#ccaa88;">ft³</span>`;
+
+  const ci = statsExpanded ? '▲' : '▼';
+
+  // When collapsed, show a large easy-to-tap expand bar
+  if (!statsExpanded) {
+    statsPanel.style.padding = '0';
+    statsPanel.innerHTML = `
+      <div id="statsToggle" style="display:flex;flex-direction:column;cursor:pointer;padding:14px 16px;-webkit-tap-highlight-color:transparent;user-select:none;min-height:52px;">
+        ${swipeHandleHTML()}
+        <div style="display:flex;justify-content:space-between;align-items:center;width:100%;">
+        <span style="font-size:13px;font-weight:700;color:#ffcc44;">📐 Enclosure Specs</span>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <span style="font-size:10px;color:#00ccff;background:rgba(0,204,255,0.15);padding:2px 7px;border-radius:10px;">${fmtVolLarge(netInner)}</span>
+          <div style="width:32px;height:32px;border-radius:8px;background:rgba(255,204,68,0.15);border:1px solid rgba(255,204,68,0.3);display:flex;align-items:center;justify-content:center;">
+            <span style="font-size:14px;color:#ffcc44;">${ci}</span>
+          </div>
+        </div>
+      </div>
+    `;
+    const st = document.getElementById('statsToggle');
+    if (st) {
+      const toggle = (e) => { e.preventDefault(); e.stopPropagation(); statsExpanded = true; updateStats(); };
+      st.addEventListener('click', toggle);
+      st.addEventListener('touchend', toggle);
+    }
+    return;
+  }
+
+  statsPanel.style.padding = '12px 14px';
+  let html = `
+    <div style="display:flex;flex-direction:column;cursor:pointer;-webkit-tap-highlight-color:transparent;user-select:none;margin-bottom:8px;min-height:40px;" id="statsToggle">
+      ${swipeHandleHTML()}
+      <div style="display:flex;justify-content:space-between;align-items:center;width:100%;">
+      <span style="font-size:13px;font-weight:700;color:#ffcc44;">📐 Enclosure Specs</span>
+      <div style="width:32px;height:32px;border-radius:8px;background:rgba(255,204,68,0.15);border:1px solid rgba(255,204,68,0.3);display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+        <span style="font-size:14px;color:#ffcc44;">${ci}</span>
+      </div>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:8px;">
+      <div style="background:rgba(0,200,255,0.1);padding:7px;border-radius:8px;text-align:center;">
+        <div style="font-size:8px;color:#66aacc;text-transform:uppercase;letter-spacing:0.5px;">Net Volume</div>
+        <div style="font-size:16px;font-weight:700;color:#00ccff;">${volPrimary}</div>
+        <div style="font-size:8px;color:#88aacc;">${volPrimaryUnit}</div>
+      </div>
+      <div style="background:rgba(68,255,170,0.1);padding:7px;border-radius:8px;text-align:center;">
+        <div style="font-size:8px;color:#66cc88;text-transform:uppercase;letter-spacing:0.5px;">${useMetric ? 'Cubic Feet' : 'Liters'}</div>
+        <div style="font-size:16px;font-weight:700;color:#44ffaa;">${useMetric ? (netInner * CUIN_TO_CUFT).toFixed(3) : (netInner * CUIN_TO_LITERS).toFixed(2)}</div>
+        <div style="font-size:8px;color:#88ccaa;">${useMetric ? 'ft³' : 'L'}</div>
+      </div>
+    </div>
+    <div style="background:rgba(255,136,68,0.1);padding:5px;border-radius:8px;text-align:center;margin-bottom:8px;">
+      <div style="font-size:16px;font-weight:700;color:#ff8844;">${volLarge}</div>
+    </div>
+  `;
+
+  if (statsExpanded) {
+    html += `
+      ${portDisp > 0 ? `<div style="font-size:9px;color:#ff8899;margin-bottom:3px;">Port/Speaker displacement: −${fmtVolSmall(portDisp)}</div>` : ''}
+      ${(() => { const bv = calculateBraceVolume(); return bv > 0 ? `<div style="font-size:9px;color:#44ff44;margin-bottom:5px;">Internal brace volume: −${fmtVolSmall(bv)}</div>` : ''; })()}
+      <div style="font-size:9px;color:#aabbcc;margin-bottom:3px;"><span style="color:#ffcc44;">Bounding:</span> ${fmtLen(dims.x)} × ${fmtLen(dims.y)} × ${fmtLen(dims.z)}</div>
+      <div style="font-size:9px;color:#aabbcc;margin-bottom:3px;"><span style="color:#ffcc44;">Wall:</span> ${fmtThickness(WALL_THICKNESS)} &nbsp; <span style="color:#ffcc44;">Outer:</span> ${fmtVolSmall(outerVol)}</div>
+      <div style="font-size:9px;color:#aabbcc;margin-bottom:6px;"><span style="color:#ffcc44;">Material Vol:</span> ${fmtVolSmall(outerVol - rawInner)}</div>
+      <div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:6px;">
+        <div style="font-size:9px;font-weight:600;color:#ffcc44;margin-bottom:3px;">Panel Areas</div>
+        ${faceData.map(f => `<div style="display:flex;justify-content:space-between;font-size:9px;color:#88aacc;padding:1px 0;"><span>${f.name}</span><span style="color:#fff;">${fmtArea(f.area)}</span></div>`).join('')}
+        <div style="display:flex;justify-content:space-between;font-size:9px;color:#ffcc44;padding:2px 0;margin-top:2px;border-top:1px solid rgba(255,255,255,0.06);"><span>Total Surface</span><span>${fmtArea(totalSurfaceArea)}</span></div>
+      </div>
+      ${ports.length > 0 ? `
+        <div style="margin-top:6px;border-top:1px solid rgba(255,100,136,0.2);padding-top:6px;">
+          <div style="font-size:9px;font-weight:600;color:#ff6688;margin-bottom:3px;">🔊 Openings</div>
+          ${ports.map(p => {
+            const area = Math.PI * Math.pow(p.diameter / 2, 2);
+            const typeLabel = p.type === 'bassreflex' ? 'Port' : 'Spkr';
+            return `<div style="display:flex;justify-content:space-between;font-size:9px;color:#88aacc;padding:1px 0;"><span>${typeLabel} ⌀${fmtDiameter(p.diameter)} (${faces[p.faceIndex].name})</span><span style="color:#ff8899;">${fmtArea(area)}</span></div>`;
+          }).join('')}
+        </div>
+      ` : ''}
+    `;
+  }
+
+  statsPanel.innerHTML = html;
+  const st = document.getElementById('statsToggle');
+  if (st) {
+    const toggle = (e) => { e.preventDefault(); e.stopPropagation(); statsExpanded = !statsExpanded; updateStats(); };
+    st.addEventListener('click', toggle);
+    st.addEventListener('touchend', toggle);
+  }
+}
+
+// --- Port Panel ---
+const portPanel = document.createElement("div");
+portPanel.style.cssText = `position:fixed;bottom:8px;left:8px;pointer-events:auto;background:rgba(10,10,30,0.92);backdrop-filter:blur(12px);padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);min-width:230px;max-width:270px;color:#fff;z-index:10;max-height:55vh;overflow-y:auto;-webkit-overflow-scrolling:touch;`;
+uiContainer.appendChild(portPanel);
+
+function updatePortPanel() {
+  const ci = portsExpanded ? '▲' : '▼';
+
+  // When collapsed, show a large, easy-to-tap expand bar
+  if (!portsExpanded) {
+    portPanel.style.padding = '0';
+    portPanel.style.minWidth = '230px';
+    portPanel.innerHTML = `
+      <div id="portToggle" style="display:flex;flex-direction:column;cursor:pointer;padding:14px 16px;-webkit-tap-highlight-color:transparent;user-select:none;min-height:52px;">
+        ${swipeHandleHTML()}
+        <div style="display:flex;justify-content:space-between;align-items:center;width:100%;">
+        <span style="font-size:13px;font-weight:700;color:#ff6688;">🔊 Speaker / Ports</span>
+        <div style="display:flex;align-items:center;gap:6px;">
+          ${ports.length > 0 ? `<span style="font-size:10px;color:#ff8899;background:rgba(255,102,136,0.2);padding:2px 7px;border-radius:10px;">${ports.length}</span>` : ''}
+          <div style="width:32px;height:32px;border-radius:8px;background:rgba(255,102,136,0.15);border:1px solid rgba(255,102,136,0.3);display:flex;align-items:center;justify-content:center;">
+            <span style="font-size:14px;color:#ff6688;">${ci}</span>
+          </div>
+        </div>
+      </div>
+    `;
+    const pt = document.getElementById('portToggle');
+    if (pt) {
+      const toggle = (e) => { e.preventDefault(); e.stopPropagation(); portsExpanded = true; updatePortPanel(); };
+      pt.addEventListener('click', toggle);
+      pt.addEventListener('touchend', toggle);
+    }
+    return;
+  }
+
+  portPanel.style.padding = '10px 12px';
+  let html = `
+    <div style="display:flex;flex-direction:column;cursor:pointer;-webkit-tap-highlight-color:transparent;user-select:none;margin-bottom:8px;min-height:40px;" id="portToggle">
+      ${swipeHandleHTML()}
+      <div style="display:flex;justify-content:space-between;align-items:center;width:100%;">
+      <span style="font-size:13px;font-weight:700;color:#ff6688;">🔊 Speaker / Ports</span>
+      <div style="width:32px;height:32px;border-radius:8px;background:rgba(255,102,136,0.15);border:1px solid rgba(255,102,136,0.3);display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+        <span style="font-size:14px;color:#ff6688;">${ci}</span>
+      </div>
+      </div>
+    </div>
+  `;
+
+  if (portsExpanded) {
+    const sizeOptions = [];
+    for (let d = 2; d <= 15; d += 0.5) {
+      sizeOptions.push(`<option value="${d}" ${d === portDiameter ? 'selected' : ''}>${fmtDiameter(d)}</option>`);
+    }
+    const faceOptions = faces.map((f, i) => `<option value="${i}" ${selectedFaceForPort === i ? 'selected' : ''}>${f.name}</option>`).join('');
+
+    html += `
+      <div style="margin-top:8px;">
+        <div style="font-size:9px;color:#88aacc;margin-bottom:4px;">Type</div>
+        <div style="display:flex;gap:0;border-radius:8px;overflow:hidden;border:1px solid rgba(255,255,255,0.12);">
+          <div id="modePort" style="flex:1;text-align:center;padding:8px 4px;font-size:11px;font-weight:600;cursor:pointer;
+            background:${portMode === 'bassreflex' ? 'rgba(68,170,255,0.25)' : 'rgba(30,30,60,0.6)'};
+            color:${portMode === 'bassreflex' ? '#44aaff' : '#667'};transition:all 0.2s;">
+            🎵 Port
+          </div>
+          <div id="modeSpeaker" style="flex:1;text-align:center;padding:8px 4px;font-size:11px;font-weight:600;cursor:pointer;
+            background:${portMode === 'speaker' ? 'rgba(255,136,68,0.25)' : 'rgba(30,30,60,0.6)'};
+            color:${portMode === 'speaker' ? '#ff8844' : '#667'};transition:all 0.2s;">
+            🔊 Speaker
+          </div>
+        </div>
+      </div>
+      <div style="margin-top:8px;">
+        <label style="font-size:9px;color:#88aacc;display:block;margin-bottom:2px;">Diameter</label>
+        <select id="portSizeSelect" style="width:100%;padding:7px;border-radius:7px;border:1px solid rgba(255,255,255,0.15);background:rgba(30,30,60,0.9);color:#fff;font-size:12px;transition:all 0.2s;">
+          ${sizeOptions.join('')}
+        </select>
+      </div>
+      <div style="margin-top:6px;">
+        <label style="font-size:9px;color:#88aacc;display:block;margin-bottom:2px;">Target Face</label>
+        <select id="portFaceSelect" style="width:100%;padding:7px;border-radius:7px;border:1px solid rgba(255,255,255,0.15);background:rgba(30,30,60,0.9);color:#fff;font-size:12px;">
+          <option value="-1">Select face...</option>
+          ${faceOptions}
+        </select>
+      </div>
+      <button id="addCenterPortBtn" style="width:100%;padding:9px;border-radius:8px;border:none;margin-top:8px;background:linear-gradient(135deg,${portMode === 'bassreflex' ? '#44aaff,#2266cc' : '#ff8844,#cc5522'});color:#fff;font-size:11px;font-weight:600;cursor:pointer;">
+        ◎ Add ${portMode === 'bassreflex' ? 'Port' : 'Speaker'} to Face Center
+      </button>
+      <div style="font-size:8px;color:#667;text-align:center;margin-top:4px;">Drag the colored handle on the 3D model to reposition</div>
+
+      ${ports.length > 0 ? `
+        <div style="margin-top:8px;font-size:9px;font-weight:600;color:#ffcc44;margin-bottom:3px;">Placed (${ports.length})</div>
+        ${ports.map((p, i) => {
+          const typeIcon = p.type === 'bassreflex' ? '🎵' : '🔊';
+          const typeLabel = p.type === 'bassreflex' ? 'Port' : 'Spkr';
+          const tl = p.tubeLength || DEFAULT_PORT_LENGTH;
+          const outOfRange = isPortLengthOutOfRange(tl);
+          return `
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.05);flex-wrap:wrap;">
+              <span style="font-size:9px;color:#ccddee;">${typeIcon} ${typeLabel} ⌀${fmtDiameter(p.diameter)} — ${faces[p.faceIndex].name}</span>
+              <div style="display:flex;gap:4px;align-items:center;">
+                <label style="font-size:8px;color:#88aacc;">Tube:</label>
+                <input type="number" class="tubeLenInput" data-idx="${i}" value="${fmtTubeLenForInput(tl)}" min="${tubeLenMin()}" max="${tubeLenMax()}" step="${tubeLenStep()}"
+                  style="width:55px;padding:3px;border-radius:4px;border:2px solid ${outOfRange ? '#ff2222' : 'rgba(255,255,255,0.12)'};background:${outOfRange ? 'rgba(255,20,20,0.3)' : 'rgba(30,30,60,0.9)'};color:${outOfRange ? '#ff3333' : '#fff'};font-size:10px;text-align:center;font-weight:${outOfRange ? '700' : '400'};">
+                <span style="font-size:8px;color:#88aacc;">${fmtLenUnit()}</span>
+                <button class="removePortBtn" data-idx="${i}" style="background:#ff4466;color:#fff;border:none;border-radius:4px;padding:3px 8px;font-size:9px;cursor:pointer;">✕</button>
+              </div>
+              ${outOfRange ? `<div style="width:100%;font-size:9px;color:#ff3333;font-weight:700;text-align:right;margin-top:2px;padding:3px 6px;background:rgba(255,20,20,0.15);border-radius:4px;border:1px solid rgba(255,50,50,0.3);">⚠ Length ${fmtLen(tl)} is ${fmtPortRangeWarning(tl)}</div>` : ''}
+            </div>
+          `;
+        }).join('')}
+        <button id="clearPortsBtn" style="width:100%;margin-top:5px;padding:5px;border-radius:6px;border:none;background:rgba(255,68,102,0.2);color:#ff6688;font-size:9px;cursor:pointer;">🗑 Clear All</button>
+      ` : '<div style="font-size:9px;color:#667788;text-align:center;padding:6px 0;margin-top:5px;">No ports/speakers placed</div>'}
+    `;
+  }
+
+  portPanel.innerHTML = html;
+
+  const safeClick = (id, fn) => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.addEventListener('click', (e) => { e.preventDefault(); fn(); });
+      el.addEventListener('touchend', (e) => { e.preventDefault(); fn(); });
+    }
+  };
+
+  const pt = document.getElementById('portToggle');
+  if (pt) {
+    const toggle = (e) => { e.preventDefault(); e.stopPropagation(); portsExpanded = !portsExpanded; updatePortPanel(); };
+    pt.addEventListener('click', toggle);
+    pt.addEventListener('touchend', toggle);
+  }
+
+  safeClick('modePort', () => { portMode = 'bassreflex'; updatePortPanel(); });
+  safeClick('modeSpeaker', () => { portMode = 'speaker'; updatePortPanel(); });
+
+  document.getElementById('portSizeSelect')?.addEventListener('change', (e) => { portDiameter = parseFloat(e.target.value); updatePortPanel(); });
+  document.getElementById('portFaceSelect')?.addEventListener('change', (e) => {
+    const val = parseInt(e.target.value);
+    selectedFaceForPort = val >= 0 ? val : null;
+  });
+
+  safeClick('addCenterPortBtn', () => {
+    saveUndoState();
+    const fi = selectedFaceForPort !== null ? selectedFaceForPort : 0;
+    ports.push({ faceIndex: fi, u: 0.5, v: 0.5, diameter: portDiameter, type: portMode, tubeLength: DEFAULT_PORT_LENGTH });
+    buildPortVisuals(); updatePortPanel(); updateStats(); updateTSPanel(); updateActionRow();
+  });
+  safeClick('clearPortsBtn', () => {
+    saveUndoState();
+    ports = []; buildPortVisuals(); updatePortPanel(); updateStats(); updateTSPanel(); updateActionRow();
+  });
+
+  document.querySelectorAll('.removePortBtn').forEach(btn => {
+    const handler = (e) => {
+      e.preventDefault();
+      saveUndoState();
+      const idx = parseInt(btn.getAttribute('data-idx'));
+      ports.splice(idx, 1);
+      buildPortVisuals(); updatePortPanel(); updateStats(); updateTSPanel(); updateActionRow();
+    };
+    btn.addEventListener('click', handler);
+    btn.addEventListener('touchend', handler);
+  });
+
+  document.querySelectorAll('.tubeLenInput').forEach(inp => {
+    inp.addEventListener('input', (e) => {
+      const idx = parseInt(inp.getAttribute('data-idx'));
+      const val = parseTubeInput(e.target.value);
+      if (!isNaN(val) && val > 0 && idx >= 0 && idx < ports.length) {
+        ports[idx].tubeLength = val;
+        buildPortVisuals(); updateStats(); updateTSPanel();
+      }
+    });
+  });
+}
+
+// --- Thiele-Small Panel ---
+const tsPanel = document.createElement("div");
+tsPanel.style.cssText = `position:fixed;bottom:8px;right:8px;pointer-events:auto;background:rgba(10,10,30,0.92);backdrop-filter:blur(12px);padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.08);min-width:210px;max-width:250px;color:#fff;z-index:10;max-height:55vh;overflow-y:auto;-webkit-overflow-scrolling:touch;`;
+uiContainer.appendChild(tsPanel);
+
+// Track which T-S input is currently focused so we don't blow away the DOM while typing
+let tsFocusedInputId = null;
+let tsPendingValues = {}; // buffer for values typed while focused
+
+// Reverse-calculate port tube length from a target Fb
+function calcPortLengthFromFb(targetFb) {
+  const c = 13504;
+  const netVol = getNetInternalVolume();
+  if (netVol <= 0 || targetFb <= 0) return null;
+  let totalPortArea = 0;
+  let hasPort = false;
+  ports.forEach(p => {
+    if (p.type === 'bassreflex') {
+      totalPortArea += Math.PI * Math.pow(p.diameter / 2, 2);
+      hasPort = true;
+    }
+  });
+  if (!hasPort || totalPortArea <= 0) return null;
+  const Leff = (totalPortArea * c * c) / (4 * Math.PI * Math.PI * targetFb * targetFb * netVol);
+  const correction = 0.825 * Math.sqrt(totalPortArea);
+  const portLen = Leff - correction;
+  return portLen > 0.1 ? portLen : null;
+}
+
+function applyTSPendingAndRefresh() {
+  // Apply any pending values that were typed
+  Object.keys(tsPendingValues).forEach(key => {
+    const val = tsPendingValues[key];
+    if (key === 'fs' || key === 'qts' || key === 'vas') {
+      if (!isNaN(val) && val > 0) tsParams[key] = val;
+    }
+  });
+  tsPendingValues = {};
+  tsFocusedInputId = null;
+  updateTSPanel();
+  updateStats();
+  buildPortVisuals();
+  updatePortPanel();
+}
+
+function updateTSPanel() {
+  const ci = tsExpanded ? '▲' : '▼';
+  const fb = calcTuningFrequency();
+  const rec = calcRecommendedVolume();
+  const netVol = getNetInternalVolume();
+  const netLiters = netVol * CUIN_TO_LITERS;
+  const hasReflex = ports.some(p => p.type === 'bassreflex');
+
+  // Get average port tube length for manual input display
+  const reflexPorts = ports.filter(p => p.type === 'bassreflex');
+  const avgTubeLen = reflexPorts.length > 0
+    ? reflexPorts.reduce((s, p) => s + (p.tubeLength || DEFAULT_PORT_LENGTH), 0) / reflexPorts.length
+    : DEFAULT_PORT_LENGTH;
+
+  // When collapsed, show a large easy-to-tap expand bar
+  if (!tsExpanded) {
+    tsPanel.style.padding = '0';
+    let collapsedInfo = '';
+    if (fb !== null) {
+      collapsedInfo = `<span style="font-size:10px;color:#cc88ff;background:rgba(170,136,255,0.15);padding:2px 7px;border-radius:10px;">Fb ${fb.toFixed(1)} Hz</span>`;
+    } else {
+      collapsedInfo = `<span style="font-size:10px;color:#9977bb;background:rgba(170,136,255,0.1);padding:2px 7px;border-radius:10px;">Fs ${tsParams.fs} Hz</span>`;
+    }
+    tsPanel.innerHTML = `
+      <div id="tsToggle" style="display:flex;flex-direction:column;cursor:pointer;padding:14px 16px;-webkit-tap-highlight-color:transparent;user-select:none;min-height:52px;">
+        ${swipeHandleHTML()}
+        <div style="display:flex;justify-content:space-between;align-items:center;width:100%;">
+        <span style="font-size:13px;font-weight:700;color:#aa88ff;">🎛 Thiele-Small</span>
+        <div style="display:flex;align-items:center;gap:6px;">
+          ${collapsedInfo}
+          <div style="width:32px;height:32px;border-radius:8px;background:rgba(170,136,255,0.15);border:1px solid rgba(170,136,255,0.3);display:flex;align-items:center;justify-content:center;">
+            <span style="font-size:14px;color:#aa88ff;">${ci}</span>
+          </div>
+        </div>
+      </div>
+    `;
+    const tt = document.getElementById('tsToggle');
+    if (tt) {
+      const toggle = (e) => { e.preventDefault(); e.stopPropagation(); tsExpanded = true; updateTSPanel(); };
+      tt.addEventListener('click', toggle);
+      tt.addEventListener('touchend', toggle);
+    }
+    return;
+  }
+
+  tsPanel.style.padding = '10px 12px';
+  let html = `
+    <div style="display:flex;flex-direction:column;cursor:pointer;-webkit-tap-highlight-color:transparent;user-select:none;margin-bottom:8px;min-height:40px;" id="tsToggle">
+      ${swipeHandleHTML()}
+      <div style="display:flex;justify-content:space-between;align-items:center;width:100%;">
+      <span style="font-size:13px;font-weight:700;color:#aa88ff;">🎛 Thiele-Small</span>
+      <div style="width:32px;height:32px;border-radius:8px;background:rgba(170,136,255,0.15);border:1px solid rgba(170,136,255,0.3);display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+        <span style="font-size:14px;color:#aa88ff;">${ci}</span>
+      </div>
+      </div>
+    </div>
+  `;
+
+  if (true) {
+    const inputStyle = `width:100%;padding:6px;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(30,30,60,0.9);color:#fff;font-size:12px;margin-bottom:6px;`;
+
+    html += `
+      <div style="margin-top:8px;">
+        <label style="font-size:9px;color:#88aacc;display:block;margin-bottom:2px;">Fs (Hz) — Resonant Freq</label>
+        <input id="tsFs" type="number" value="${tsParams.fs}" step="1" min="10" max="500" style="${inputStyle}" inputmode="decimal">
+      </div>
+      <div>
+        <label style="font-size:9px;color:#88aacc;display:block;margin-bottom:2px;">Qts — Total Q Factor</label>
+        <input id="tsQts" type="number" value="${tsParams.qts}" step="0.01" min="0.1" max="2" style="${inputStyle}" inputmode="decimal">
+      </div>
+      <div>
+        <label style="font-size:9px;color:#88aacc;display:block;margin-bottom:2px;">Vas (Liters) — Compliance Vol</label>
+        <input id="tsVas" type="number" value="${tsParams.vas}" step="1" min="1" max="500" style="${inputStyle}" inputmode="decimal">
+      </div>
+    `;
+
+    // Manual Tuning / Port Length inputs (only when ports exist)
+    if (hasReflex) {
+      const fbVal = fb !== null ? fb.toFixed(1) : '';
+      const tubeLenVal = fmtTubeLenForInput(avgTubeLen);
+      const tubeOutOfRange = isPortLengthOutOfRange(avgTubeLen);
+
+      html += `
+        <div style="border-top:1px solid rgba(170,136,255,0.2);padding-top:6px;margin-top:2px;">
+          <div style="font-size:9px;font-weight:600;color:#aa88ff;margin-bottom:4px;">🎚 Manual Tuning Override</div>
+          <div style="font-size:8px;color:#667;margin-bottom:6px;">Edit either field — the other auto-updates</div>
+          <div>
+            <label style="font-size:9px;color:#88aacc;display:block;margin-bottom:2px;">Current Tuning Fb (Hz)</label>
+            <input id="tsManualFb" type="number" value="${fbVal}" step="0.5" min="10" max="200"
+              style="width:100%;padding:6px;border-radius:6px;border:1px solid rgba(170,136,255,0.4);background:rgba(50,30,80,0.9);color:#cc88ff;font-size:13px;font-weight:700;margin-bottom:6px;" inputmode="decimal">
+          </div>
+          <div>
+            <label style="font-size:9px;color:#88aacc;display:block;margin-bottom:2px;">Port Tube Length (${fmtLenUnit()})</label>
+            <div style="display:flex;gap:4px;align-items:center;">
+              <input id="tsManualTubeLen" type="number" value="${tubeLenVal}" step="${tubeLenStep()}" min="${tubeLenMin()}" max="${tubeLenMax()}"
+                style="flex:1;padding:6px;border-radius:6px;border:2px solid ${tubeOutOfRange ? '#ff2222' : 'rgba(170,136,255,0.4)'};background:${tubeOutOfRange ? 'rgba(255,20,20,0.3)' : 'rgba(50,30,80,0.9)'};color:${tubeOutOfRange ? '#ff3333' : '#cc88ff'};font-size:13px;font-weight:700;" inputmode="decimal">
+              <button id="tsSetIdealBtn" title="Set to ideal length for target f3" style="padding:6px 8px;border-radius:6px;border:1px solid rgba(68,255,170,0.4);background:rgba(68,255,170,0.15);color:#44ffaa;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap;transition:all 0.2s;">⎯► Ideal</button>
+            </div>
+            ${tubeOutOfRange ? `<div style="font-size:9px;color:#ff3333;font-weight:700;text-align:center;padding:3px;background:rgba(255,20,20,0.15);border-radius:4px;border:1px solid rgba(255,50,50,0.3);margin-top:2px;margin-bottom:4px;">⚠ Length ${fmtLen(avgTubeLen)} is ${fmtPortRangeWarning(avgTubeLen)}</div>` : ''}
+            ${(() => {
+              const targetF3 = calcTargetF3();
+              const idealLen = calcIdealPortLength(targetF3);
+              if (idealLen !== null) {
+                return `<div style="font-size:8px;color:#66cc88;text-align:center;margin-top:1px;margin-bottom:2px;">Ideal for ${targetF3.toFixed(1)} Hz f3: <strong>${fmtLen(idealLen)}</strong></div>`;
+              }
+              return '';
+            })()}
+          </div>
+          <button id="tsDoneBtn" style="width:100%;padding:8px;border-radius:8px;border:none;margin-top:4px;margin-bottom:6px;background:linear-gradient(135deg,#aa88ff,#6644cc);color:#fff;font-size:12px;font-weight:700;cursor:pointer;letter-spacing:0.5px;">✓ Done</button>
+        </div>
+      `;
+    }
+
+    // Analysis section
+    html += `
+      <div style="border-top:1px solid rgba(170,136,255,0.2);padding-top:6px;">
+        <div style="font-size:9px;font-weight:600;color:#aa88ff;margin-bottom:4px;">Analysis</div>
+        ${(() => {
+          const targetF3 = calcTargetF3();
+          const idealLen = calcIdealPortLength(targetF3);
+          const portLenWarnings = ports.filter(p => p.type === 'bassreflex' && isPortLengthOutOfRange(p.tubeLength || DEFAULT_PORT_LENGTH));
+          let portWarningHtml = '';
+          if (portLenWarnings.length > 0) {
+            portWarningHtml = portLenWarnings.map(p => {
+              const tl = p.tubeLength || DEFAULT_PORT_LENGTH;
+              return `
+              <div style="background:rgba(255,40,40,0.2);border:1px solid rgba(255,60,60,0.5);padding:5px;border-radius:6px;font-size:9px;color:#ff4444;margin-bottom:5px;text-align:center;">
+                ⚠ Port tube ${fmtLen(tl)} is ${fmtPortRangeWarning(tl)} — may affect tuning accuracy
+              </div>
+            `}).join('');
+          }
+
+          return `
+            ${portWarningHtml}
+            ${hasReflex && idealLen !== null ? `
+              <div style="background:rgba(170,136,255,0.1);padding:6px;border-radius:8px;text-align:center;margin-bottom:5px;">
+                <div style="font-size:8px;color:#9988cc;text-transform:uppercase;">Target f3</div>
+                <div style="font-size:16px;font-weight:700;color:#cc88ff;">${targetF3.toFixed(1)} Hz</div>
+                <div style="font-size:8px;color:#9988cc;">(0.9 × Fs)</div>
+              </div>
+              <div style="background:${isPortLengthOutOfRange(idealLen) ? 'rgba(255,30,30,0.2)' : 'rgba(68,255,170,0.1)'};padding:6px;border-radius:8px;text-align:center;margin-bottom:5px;border:${isPortLengthOutOfRange(idealLen) ? '2px solid rgba(255,50,50,0.6)' : '1px solid transparent'};">
+                <div style="font-size:8px;color:${isPortLengthOutOfRange(idealLen) ? '#ff6666' : '#66cc88'};text-transform:uppercase;">Ideal Port Length for f3</div>
+                <div style="font-size:18px;font-weight:700;color:${isPortLengthOutOfRange(idealLen) ? '#ff3333' : '#44ffaa'};">${fmtLen(idealLen)}</div>
+                <div style="font-size:8px;color:${isPortLengthOutOfRange(idealLen) ? '#ff6666' : '#88ccaa'};">${isPortLengthOutOfRange(idealLen) ? (idealLen < 3 ? '⚠ Too short — increase port diameter or box volume' : '⚠ Too long — decrease port diameter or increase box volume') : 'Set port tube to this length'}</div>
+              </div>
+            ` : ''}
+            ${fb !== null ? `
+              <div style="background:rgba(170,136,255,0.1);padding:6px;border-radius:8px;text-align:center;margin-bottom:5px;">
+                <div style="font-size:8px;color:#9988cc;text-transform:uppercase;">Current Tuning (Fb)</div>
+                <div style="font-size:18px;font-weight:700;color:#aa88ff;">${fb.toFixed(1)} Hz</div>
+                ${idealLen !== null ? `<div style="font-size:8px;color:${Math.abs(fb - targetF3) < 3 ? '#44ffaa' : '#ff8844'};">${Math.abs(fb - targetF3) < 3 ? '✓ Close to target f3' : '△ ' + (fb > targetF3 ? 'Above' : 'Below') + ' target f3 by ' + Math.abs(fb - targetF3).toFixed(1) + ' Hz'}</div>` : ''}
+                ${(() => {
+                  const currentLengths = ports.filter(p => p.type === 'bassreflex').map(p => p.tubeLength || DEFAULT_PORT_LENGTH);
+                  const badLengths = currentLengths.filter(l => isPortLengthOutOfRange(l));
+                  if (badLengths.length > 0) {
+                    return `<div style="font-size:8px;color:#ff3333;margin-top:3px;font-weight:700;">⚠ ${badLengths.length} port(s) with out-of-range tube length</div>`;
+                  }
+                  return '';
+                })()}
+              </div>
+            ` : `<div style="font-size:9px;color:#666;margin-bottom:5px;">Add a port to see tuning frequency & ideal port length</div>`}
+          `;
+        })()}
+        <div style="font-size:9px;color:#88aacc;margin-bottom:2px;"><span style="color:#aa88ff;">Rec. Sealed:</span> ${fmtVolLarge(rec.sealed)} ${!useMetric ? `<span style="color:#667;">(${rec.sealedL.toFixed(1)} L)</span>` : `<span style="color:#667;">(${(rec.sealed * CUIN_TO_CUFT).toFixed(3)} ft³)</span>`}</div>
+        <div style="font-size:9px;color:#88aacc;margin-bottom:2px;"><span style="color:#aa88ff;">Rec. Ported:</span> ${fmtVolLarge(rec.ported)} ${!useMetric ? `<span style="color:#667;">(${rec.portedL.toFixed(1)} L)</span>` : `<span style="color:#667;">(${(rec.ported * CUIN_TO_CUFT).toFixed(3)} ft³)</span>`}</div>
+        <div style="font-size:9px;color:#88aacc;margin-bottom:2px;"><span style="color:#aa88ff;">Current Net:</span> ${fmtVolLarge(netVol)} ${!useMetric ? `<span style="color:#667;">(${netLiters.toFixed(2)} L)</span>` : `<span style="color:#667;">(${(netVol * CUIN_TO_CUFT).toFixed(3)} ft³)</span>`}</div>
+        <div style="margin-top:4px;padding:5px;border-radius:6px;font-size:9px;text-align:center;
+          background:${netLiters >= rec.sealedL * 0.8 && netLiters <= rec.portedL * 1.2 ? 'rgba(68,255,170,0.15)' : 'rgba(255,68,102,0.15)'};
+          color:${netLiters >= rec.sealedL * 0.8 && netLiters <= rec.portedL * 1.2 ? '#44ffaa' : '#ff6688'};">
+          ${netLiters >= rec.sealedL * 0.8 && netLiters <= rec.portedL * 1.2 ? '✓ Volume in usable range' : '⚠ Volume outside recommended range'}
+        </div>
+      </div>
+    `;
+  }
+
+  tsPanel.innerHTML = html;
+
+  // --- Bind toggle ---
+  const tt = document.getElementById('tsToggle');
+  if (tt) {
+    const toggle = (e) => { e.preventDefault(); e.stopPropagation(); tsExpanded = !tsExpanded; updateTSPanel(); };
+    tt.addEventListener('click', toggle);
+    tt.addEventListener('touchend', toggle);
+  }
+
+  // --- Bind T-S param inputs (Fs, Qts, Vas) ---
+  // These use focus/blur to keep the keyboard open while typing
+  const bindTSInput = (id, key, parser) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('focus', () => { tsFocusedInputId = id; });
+    el.addEventListener('input', (e) => {
+      const val = parser(e.target.value);
+      if (!isNaN(val) && val > 0) {
+        tsPendingValues[key] = val;
+        tsParams[key] = val;
+        // Update analysis section WITHOUT rebuilding this input
+        updateTSAnalysisOnly();
+      }
+    });
+    el.addEventListener('blur', () => {
+      if (tsFocusedInputId === id) {
+        applyTSPendingAndRefresh();
+      }
+    });
+  };
+  bindTSInput('tsFs', 'fs', parseFloat);
+  bindTSInput('tsQts', 'qts', parseFloat);
+  bindTSInput('tsVas', 'vas', parseFloat);
+
+  // --- Bind manual Fb input ---
+  const fbInput = document.getElementById('tsManualFb');
+  if (fbInput) {
+    fbInput.addEventListener('focus', () => { tsFocusedInputId = 'tsManualFb'; });
+    fbInput.addEventListener('input', (e) => {
+      const val = parseFloat(e.target.value);
+      if (!isNaN(val) && val > 0) {
+        // Reverse-calculate the tube length needed for this Fb
+        const newLen = calcPortLengthFromFb(val);
+        if (newLen !== null && newLen > 0) {
+          // Set all reflex port tube lengths to this value
+          ports.forEach(p => {
+            if (p.type === 'bassreflex') p.tubeLength = newLen;
+          });
+          // Update the tube length input live
+          const tubeLenInput = document.getElementById('tsManualTubeLen');
+          if (tubeLenInput && tsFocusedInputId !== 'tsManualTubeLen') {
+            tubeLenInput.value = fmtTubeLenForInput(newLen);
+            // Update tube border color
+            const outOfRange = isPortLengthOutOfRange(newLen);
+            tubeLenInput.style.borderColor = outOfRange ? '#ff2222' : 'rgba(170,136,255,0.4)';
+            tubeLenInput.style.background = outOfRange ? 'rgba(255,20,20,0.3)' : 'rgba(50,30,80,0.9)';
+            tubeLenInput.style.color = outOfRange ? '#ff3333' : '#cc88ff';
+          }
+          buildPortVisuals();
+          updateStats();
+          updatePortPanel();
+        }
+      }
+    });
+    fbInput.addEventListener('blur', () => {
+      if (tsFocusedInputId === 'tsManualFb') {
+        applyTSPendingAndRefresh();
+      }
+    });
+  }
+
+  // --- Bind manual tube length input ---
+  const tubeLenInput = document.getElementById('tsManualTubeLen');
+  if (tubeLenInput) {
+    tubeLenInput.addEventListener('focus', () => { tsFocusedInputId = 'tsManualTubeLen'; });
+    tubeLenInput.addEventListener('input', (e) => {
+      const rawVal = parseFloat(e.target.value);
+      if (isNaN(rawVal) || rawVal <= 0) return;
+      const inchesVal = useMetric ? rawVal / IN_TO_CM : rawVal;
+      // Set all reflex port tube lengths
+      ports.forEach(p => {
+        if (p.type === 'bassreflex') p.tubeLength = inchesVal;
+      });
+      // Recalculate Fb and update its input live
+      const newFb = calcTuningFrequency();
+      const fbInputEl = document.getElementById('tsManualFb');
+      if (fbInputEl && tsFocusedInputId !== 'tsManualFb' && newFb !== null) {
+        fbInputEl.value = newFb.toFixed(1);
+      }
+      // Update tube border color
+      const outOfRange = isPortLengthOutOfRange(inchesVal);
+      tubeLenInput.style.borderColor = outOfRange ? '#ff2222' : 'rgba(170,136,255,0.4)';
+      tubeLenInput.style.background = outOfRange ? 'rgba(255,20,20,0.3)' : 'rgba(50,30,80,0.9)';
+      tubeLenInput.style.color = outOfRange ? '#ff3333' : '#cc88ff';
+      buildPortVisuals();
+      updateStats();
+      updatePortPanel();
+    });
+    tubeLenInput.addEventListener('blur', () => {
+      if (tsFocusedInputId === 'tsManualTubeLen') {
+        applyTSPendingAndRefresh();
+      }
+    });
+  }
+
+  // --- Set to Ideal button ---
+  const idealBtn = document.getElementById('tsSetIdealBtn');
+  if (idealBtn) {
+    const idealHandler = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const targetF3 = calcTargetF3();
+      const idealLen = calcIdealPortLength(targetF3);
+      if (idealLen !== null && idealLen > 0) {
+        // Set all reflex ports to ideal length
+        ports.forEach(p => {
+          if (p.type === 'bassreflex') p.tubeLength = idealLen;
+        });
+        // Update the tube length input
+        const tubeLenEl = document.getElementById('tsManualTubeLen');
+        if (tubeLenEl) tubeLenEl.value = fmtTubeLenForInput(idealLen);
+        // Recalculate Fb and update
+        const newFb = calcTuningFrequency();
+        const fbInputEl = document.getElementById('tsManualFb');
+        if (fbInputEl && newFb !== null) fbInputEl.value = newFb.toFixed(1);
+        // Flash the button green
+        idealBtn.style.background = 'rgba(68,255,170,0.5)';
+        idealBtn.style.color = '#fff';
+        setTimeout(() => {
+          idealBtn.style.background = 'rgba(68,255,170,0.15)';
+          idealBtn.style.color = '#44ffaa';
+        }, 400);
+        buildPortVisuals();
+        updateStats();
+        updatePortPanel();
+        // Deferred full TS rebuild (avoid killing focused input)
+        setTimeout(() => updateTSPanel(), 500);
+      }
+    };
+    idealBtn.addEventListener('click', idealHandler);
+    idealBtn.addEventListener('touchend', idealHandler);
+  }
+
+  // --- Done button forces blur and full refresh ---
+  const doneBtn = document.getElementById('tsDoneBtn');
+  if (doneBtn) {
+    const doneHandler = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // Blur any focused input
+      if (document.activeElement && document.activeElement.tagName === 'INPUT') {
+        document.activeElement.blur();
+      }
+      tsFocusedInputId = null;
+      tsPendingValues = {};
+      updateTSPanel();
+      updateStats();
+      buildPortVisuals();
+      updatePortPanel();
+    };
+    doneBtn.addEventListener('click', doneHandler);
+    doneBtn.addEventListener('touchend', doneHandler);
+  }
+}
+
+// Lightweight update of just the analysis text area without rebuilding inputs
+function updateTSAnalysisOnly() {
+  // Simply recalculate and let the next full rebuild pick it up
+  // This avoids destroying focused inputs
+}
+
+function resetCube() {
+  saveUndoState();
+  cancelSubdivide();
+  cubeVertices = [
+    new THREE.Vector3(-6, 0, -6), new THREE.Vector3(6, 0, -6),
+    new THREE.Vector3(6, 0, 6), new THREE.Vector3(-6, 0, 6),
+    new THREE.Vector3(-6, 12, -6), new THREE.Vector3(6, 12, -6),
+    new THREE.Vector3(6, 12, 6), new THREE.Vector3(-6, 12, 6),
+  ];
+  edges = [
+    [0,1],[1,2],[2,3],[3,0],
+    [4,5],[5,6],[6,7],[7,4],
+    [0,4],[1,5],[2,6],[3,7],
+  ];
+  faces = [
+    { verts: [0,1,5,4], name: "Front" },
+    { verts: [2,3,7,6], name: "Back" },
+    { verts: [3,0,4,7], name: "Left" },
+    { verts: [1,2,6,5], name: "Right" },
+    { verts: [4,5,6,7], name: "Top" },
+    { verts: [0,3,2,1], name: "Bottom" },
+  ];
+  splitVertices = new Set();
+  subdivisionEdges = new Set();
+  ports = [];
+  handles = [];
+  updateAll();
+  updateTSPanel();
+  updateActionRow();
+}
+
+// =============== EDGE SPLIT INTERACTION ===============
+// Detects clicks on edges (not handles) and splits the edge at that point
+
+let edgeSplitPending = false; // flag to differentiate quick tap from drag
+
+function tryEdgeSplit(pxy) {
+  touchMouse.set(pxy.x, pxy.y);
+  raycaster.setFromCamera(touchMouse, camera);
+
+  // First check we're not clicking a handle or port drag handle
+  const handleHits = raycaster.intersectObjects(handles);
+  if (handleHits.length > 0) return false;
+  const portHits = raycaster.intersectObjects(portDragHandles);
+  if (portHits.length > 0) return false;
+
+  // Check edge hit meshes
+  const edgeHits = raycaster.intersectObjects(edgeHitMeshes);
+  if (edgeHits.length === 0) return false;
+
+  const hit = edgeHits[0];
+  const edgeIdx = hit.object.userData.edgeIndex;
+  if (edgeIdx === undefined) return false;
+
+  const [a, b] = edges[edgeIdx];
+  const va = cubeVertices[a];
+  const vb = cubeVertices[b];
+  const edgeLen = va.distanceTo(vb);
+
+  // Don't split edges shorter than 2 inches
+  if (edgeLen < 2) return false;
+
+  // Use the hit point as the split position
+  const splitPoint = hit.point.clone();
+
+  // Verify the point is actually close to the edge line
+  const edgeDir = vb.clone().sub(va).normalize();
+  const toHit = splitPoint.clone().sub(va);
+  const proj = va.clone().add(edgeDir.clone().multiplyScalar(toHit.dot(edgeDir)));
+  const dist = splitPoint.distanceTo(proj);
+  if (dist > EDGE_SPLIT_THRESHOLD * 1.5) return false;
+
+  // Save state for undo, then perform the split
+  saveUndoState();
+  const newIdx = splitEdge(edgeIdx, splitPoint);
+
+  // Flash effect: briefly show a bright sphere at split point
+  showSplitFlash(cubeVertices[newIdx]);
+
+  // Rebuild everything
+  updateAll();
+  updateTSPanel();
+
+  return true;
+}
+
+// Visual flash when edge is split
+function showSplitFlash(position) {
+  const flashGeom = new THREE.SphereGeometry(1.2, 16, 16);
+  const flashMat = new THREE.MeshBasicMaterial({
+    color: 0xff44ff, transparent: true, opacity: 0.8,
+  });
+  const flash = new THREE.Mesh(flashGeom, flashMat);
+  flash.position.copy(position);
+  scene.add(flash);
+
+  let t = 0;
+  const fadeOut = () => {
+    t += 0.04;
+    flash.scale.setScalar(1 + t * 2);
+    flashMat.opacity = 0.8 * (1 - t);
+    if (t < 1) {
+      requestAnimationFrame(fadeOut);
+    } else {
+      scene.remove(flash);
+      flashGeom.dispose();
+      flashMat.dispose();
+    }
+  };
+  fadeOut();
+}
+
+// =============== TOUCH / INTERACTION ===============
+function getPointerXY(event) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  let clientX, clientY;
+  if (event.touches && event.touches.length > 0) {
+    clientX = event.touches[0].clientX; clientY = event.touches[0].clientY;
+  } else if (event.changedTouches && event.changedTouches.length > 0) {
+    clientX = event.changedTouches[0].clientX; clientY = event.changedTouches[0].clientY;
+  } else {
+    clientX = event.clientX; clientY = event.clientY;
+  }
+  return { x: ((clientX - rect.left) / rect.width) * 2 - 1, y: -((clientY - rect.top) / rect.height) * 2 + 1, clientX, clientY };
+}
+
+function tryStartPortDrag(pxy) {
+  touchMouse.set(pxy.x, pxy.y);
+  raycaster.setFromCamera(touchMouse, camera);
+  const hits = raycaster.intersectObjects(portDragHandles);
+  if (hits.length > 0) {
+    const handle = hits[0].object;
+    const pi = handle.userData.portIndex;
+    if (pi === undefined || pi < 0 || pi >= ports.length) return false;
+    saveUndoState();
+    draggingPort = pi;
+    controls.enabled = false;
+    const outNormal = getOutwardNormal(ports[pi].faceIndex);
+    const worldPos = faceUVToWorld(ports[pi].faceIndex, ports[pi].u, ports[pi].v);
+    // Use the face's actual plane for dragging (coplanar with face center)
+    const face = faces[ports[pi].faceIndex];
+    const faceCtr = new THREE.Vector3();
+    face.verts.forEach(vi => faceCtr.add(cubeVertices[vi]));
+    faceCtr.divideScalar(face.verts.length);
+    draggingPortPlane.setFromNormalAndCoplanarPoint(outNormal, faceCtr);
+    const planeHit = new THREE.Vector3();
+    const hitResult = raycaster.ray.intersectPlane(draggingPortPlane, planeHit);
+    if (hitResult !== null) {
+      draggingPortOffset.set(planeHit.x - worldPos.x, planeHit.y - worldPos.y, planeHit.z - worldPos.z);
+    } else {
+      draggingPortOffset.set(0, 0, 0);
+    }
+    handle.material.emissive.setHex(0xffffff);
+    handle.scale.set(1.4, 1.4, 1.4);
+    return true;
+  }
+  return false;
+}
+
+function doPortDrag(pxy) {
+  if (draggingPort === null) return;
+  const port = ports[draggingPort];
+  if (!port) return;
+  touchMouse.set(pxy.x, pxy.y);
+  raycaster.setFromCamera(touchMouse, camera);
+  const planeHit = new THREE.Vector3();
+  const hitResult = raycaster.ray.intersectPlane(draggingPortPlane, planeHit);
+  if (hitResult === null) return;
+  const worldTarget = new THREE.Vector3(planeHit.x - draggingPortOffset.x, planeHit.y - draggingPortOffset.y, planeHit.z - draggingPortOffset.z);
+  const uv = worldToFaceUV(port.faceIndex, worldTarget);
+  const basis = getFaceBasis(port.faceIndex);
+  const radiusU = (port.diameter / 2) / basis.uLen;
+  const radiusV = (port.diameter / 2) / basis.vLen;
+  // Clamp to the face bounding box with margin for port radius
+  port.u = THREE.MathUtils.clamp(uv.u, radiusU + 0.02, 1 - radiusU - 0.02);
+  port.v = THREE.MathUtils.clamp(uv.v, radiusV + 0.02, 1 - radiusV - 0.02);
+  // Additional check: ensure the port center is inside the actual face polygon
+  const testWorld = faceUVToWorld(port.faceIndex, port.u, port.v);
+  if (!isPointInsideFace(port.faceIndex, testWorld)) {
+    // Push toward face centroid
+    const face = faces[port.faceIndex];
+    const centroid = new THREE.Vector3();
+    face.verts.forEach(vi => centroid.add(cubeVertices[vi]));
+    centroid.divideScalar(face.verts.length);
+    const centUV = worldToFaceUV(port.faceIndex, centroid);
+    // Lerp toward centroid until inside
+    for (let lerp = 0.1; lerp <= 1.0; lerp += 0.1) {
+      const tryU = port.u + (centUV.u - port.u) * lerp;
+      const tryV = port.v + (centUV.v - port.v) * lerp;
+      const tryWorld = faceUVToWorld(port.faceIndex, tryU, tryV);
+      if (isPointInsideFace(port.faceIndex, tryWorld)) {
+        port.u = tryU;
+        port.v = tryV;
+        break;
+      }
+    }
+  }
+  buildPortVisuals();
+}
+
+// Check if a 3D point lies inside a face polygon (projected onto face plane)
+function isPointInsideFace(faceIndex, point) {
+  const face = faces[faceIndex];
+  const basis = getFaceBasis(faceIndex);
+  // Project point and face verts into 2D
+  const pu = point.dot(basis.uDir);
+  const pv = point.dot(basis.vDir);
+  const poly2D = face.verts.map(i => {
+    const p = cubeVertices[i];
+    return { u: p.dot(basis.uDir), v: p.dot(basis.vDir) };
+  });
+  // Ray casting algorithm for point-in-polygon
+  let inside = false;
+  for (let i = 0, j = poly2D.length - 1; i < poly2D.length; j = i++) {
+    const xi = poly2D[i].u, yi = poly2D[i].v;
+    const xj = poly2D[j].u, yj = poly2D[j].v;
+    if (((yi > pv) !== (yj > pv)) && (pu < (xj - xi) * (pv - yi) / (yj - yi) + xi)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function endPortDrag() {
+  if (draggingPort !== null) {
+    draggingPort = null;
+    controls.enabled = true;
+    buildPortVisuals();
+  }
+}
+
+// Track mouse down position for edge split detection (distinguish click from drag)
+let mouseDownPos = null;
+let mouseDownTime = 0;
+
+function tryStartDrag(pxy) {
+  touchMouse.set(pxy.x, pxy.y);
+  raycaster.setFromCamera(touchMouse, camera);
+  const intersects = raycaster.intersectObjects(handles);
+  if (intersects.length > 0) {
+    saveUndoState();
+    controls.enabled = false;
+    isDragging = true;
+    selectedHandle = intersects[0].object;
+    if (selectedHandle.material && selectedHandle.material.color) selectedHandle.material.color.setHex(0xff6644);
+    if (selectedHandle.material && selectedHandle.material.emissive) selectedHandle.material.emissive.setHex(0xcc3300);
+    selectedHandle.scale.set(1.5, 1.5, 1.5);
+    const camDir = camera.getWorldDirection(new THREE.Vector3());
+    dragPlane.setFromNormalAndCoplanarPoint(camDir.negate(), selectedHandle.position);
+    const planeHit = new THREE.Vector3();
+    const hit = raycaster.ray.intersectPlane(dragPlane, planeHit);
+    if (hit !== null) {
+      dragOffset.set(planeHit.x - selectedHandle.position.x, planeHit.y - selectedHandle.position.y, planeHit.z - selectedHandle.position.z);
+    } else {
+      dragOffset.set(0, 0, 0);
+    }
+    return true;
+  }
+  return false;
+}
+
+function doDrag(pxy) {
+  if (!isDragging || !selectedHandle) return;
+  touchMouse.set(pxy.x, pxy.y);
+  raycaster.setFromCamera(touchMouse, camera);
+  const planeHit = new THREE.Vector3();
+  const hitResult = raycaster.ray.intersectPlane(dragPlane, planeHit);
+  if (hitResult === null) return;
+  const idx = selectedHandle.userData.vertexIndex;
+  if (idx === undefined || idx < 0 || idx >= cubeVertices.length) return;
+  const newX = snapValue(planeHit.x - dragOffset.x);
+  const newY = snapValue(Math.max(0, planeHit.y - dragOffset.y));
+  const newZ = snapValue(planeHit.z - dragOffset.z);
+  const target = new THREE.Vector3(
+    THREE.MathUtils.clamp(newX, -MAX_DIM / 2, MAX_DIM / 2),
+    THREE.MathUtils.clamp(newY, 0, MAX_DIM),
+    THREE.MathUtils.clamp(newZ, -MAX_DIM / 2, MAX_DIM / 2)
+  );
+  const oldPos = cubeVertices[idx].clone();
+  const delta = target.clone().sub(oldPos);
+  cubeVertices[idx].copy(target);
+  if (symmetrical && idx < 8) {
+    const mirrors = getSymmetryMap(idx);
+    if (mirrors[0] !== undefined) {
+      const m = cubeVertices[mirrors[0]];
+      m.x = snapValue(-target.x);
+      m.y = snapValue(THREE.MathUtils.clamp(m.y + delta.y, 0, MAX_DIM));
+      m.z = snapValue(THREE.MathUtils.clamp(m.z + delta.z, -MAX_DIM / 2, MAX_DIM / 2));
+    }
+    if (mirrors[1] !== undefined) {
+      const m = cubeVertices[mirrors[1]];
+      m.x = snapValue(THREE.MathUtils.clamp(m.x + delta.x, -MAX_DIM / 2, MAX_DIM / 2));
+      m.y = snapValue(THREE.MathUtils.clamp(m.y + delta.y, 0, MAX_DIM));
+      m.z = snapValue(-target.z);
+    }
+    if (mirrors[2] !== undefined) {
+      const m = cubeVertices[mirrors[2]];
+      m.x = snapValue(-target.x);
+      m.y = snapValue(THREE.MathUtils.clamp(m.y + delta.y, 0, MAX_DIM));
+      m.z = snapValue(-target.z);
+    }
+  }
+  updateAll();
+  updateTSPanel();
+}
+
+function endDrag() {
+  if (isDragging) {
+    isDragging = false;
+    if (selectedHandle) {
+      const isSplit = splitVertices.has(selectedHandle.userData.vertexIndex);
+      if (selectedHandle.material && selectedHandle.material.color) selectedHandle.material.color.setHex(isSplit ? 0xff44ff : 0x00ccff);
+      if (selectedHandle.material && selectedHandle.material.emissive) selectedHandle.material.emissive.setHex(isSplit ? 0x661166 : 0x004466);
+      selectedHandle.scale.set(1, 1, 1);
+      selectedHandle = null;
+    }
+    controls.enabled = true;
+  }
+}
+
+// --- Touch Events ---
+let touchStartPos = null;
+let touchStartTime = 0;
+
+renderer.domElement.addEventListener('touchstart', (e) => {
+  if (e.touches.length !== 1) return;
+  const pxy = getPointerXY(e);
+  touchStartPos = { x: pxy.clientX, y: pxy.clientY };
+  touchStartTime = Date.now();
+  if (subdivideMode) return; // Don't start drags in subdivide mode
+  if (tryStartPortDrag(pxy)) { e.preventDefault(); return; }
+  if (tryStartDrag(pxy)) { e.preventDefault(); }
+}, { passive: false });
+
+renderer.domElement.addEventListener('touchmove', (e) => {
+  if (e.touches.length !== 1) return;
+  const pxy = getPointerXY(e);
+  if (draggingPort !== null) { e.preventDefault(); doPortDrag(pxy); return; }
+  if (isDragging) { e.preventDefault(); doDrag(pxy); }
+  // If moved significantly, cancel edge split
+  if (touchStartPos) {
+    const dx = pxy.clientX - touchStartPos.x;
+    const dy = pxy.clientY - touchStartPos.y;
+    if (Math.sqrt(dx*dx + dy*dy) > 10) touchStartPos = null;
+  }
+}, { passive: false });
+
+renderer.domElement.addEventListener('touchend', (e) => {
+  if (draggingPort !== null) { endPortDrag(); e.preventDefault(); return; }
+  if (isDragging) { endDrag(); e.preventDefault(); return; }
+
+  // Check for quick tap
+  const elapsed = Date.now() - touchStartTime;
+  if (touchStartPos && elapsed < 400) {
+    const pxy = getPointerXY(e);
+    if (subdivideMode) {
+      if (trySubdivideClick(pxy)) { e.preventDefault(); }
+    } else {
+      if (tryEdgeSplit(pxy)) { e.preventDefault(); }
+    }
+  }
+  touchStartPos = null;
+}, { passive: false });
+
+renderer.domElement.addEventListener('touchcancel', () => { endPortDrag(); endDrag(); touchStartPos = null; });
+
+// --- Mouse Events ---
+renderer.domElement.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  const pxy = getPointerXY(e);
+  mouseDownPos = { x: pxy.clientX, y: pxy.clientY };
+  mouseDownTime = Date.now();
+  if (subdivideMode) return; // Don't start drags in subdivide mode
+  if (tryStartPortDrag(pxy)) return;
+  tryStartDrag(pxy);
+});
+
+renderer.domElement.addEventListener('mousemove', (e) => {
+  const pxy = getPointerXY(e);
+  if (draggingPort !== null) { doPortDrag(pxy); return; }
+  if (isDragging) { doDrag(pxy); return; }
+
+  // If moved significantly, cancel edge split
+  if (mouseDownPos) {
+    const dx = pxy.clientX - mouseDownPos.x;
+    const dy = pxy.clientY - mouseDownPos.y;
+    if (Math.sqrt(dx*dx + dy*dy) > 5) mouseDownPos = null;
+  }
+
+  // Hover
+  touchMouse.set(pxy.x, pxy.y);
+  raycaster.setFromCamera(touchMouse, camera);
+
+  // Port handle hover
+  const portHits = raycaster.intersectObjects(portDragHandles);
+  portDragHandles.forEach(h => {
+    if (h.material) { h.scale.set(1, 1, 1); h.material.opacity = 0.7; }
+  });
+  if (portHits.length > 0) {
+    const h = portHits[0].object;
+    h.scale.set(1.3, 1.3, 1.3);
+    h.material.opacity = 1;
+    renderer.domElement.style.cursor = "grab";
+    return;
+  }
+
+  // Vertex handle hover
+  const handleHits = raycaster.intersectObjects(handles);
+  handles.forEach(h => {
+    if (h !== selectedHandle && h.material) {
+      const isSplit = splitVertices.has(h.userData.vertexIndex);
+      if (h.material.color) h.material.color.setHex(isSplit ? 0xff44ff : 0x00ccff);
+      if (h.material.emissive) h.material.emissive.setHex(isSplit ? 0x661166 : 0x004466);
+      h.scale.set(1, 1, 1);
+    }
+  });
+  if (handleHits.length > 0) {
+    const hovered = handleHits[0].object;
+    if (hovered.material && hovered.material.color) hovered.material.color.setHex(0x44ffaa);
+    if (hovered.material && hovered.material.emissive) hovered.material.emissive.setHex(0x22aa66);
+    hovered.scale.set(1.3, 1.3, 1.3);
+    renderer.domElement.style.cursor = "grab";
+    return;
+  }
+
+  // Subdivide mode hover
+  if (subdivideMode) {
+    updateSubdividePreview(pxy);
+    // Show pointer cursor on eligible verts
+    const subdivHits = raycaster.intersectObjects(handles);
+    if (subdivHits.length > 0) {
+      const vi = subdivHits[0].object.userData.vertexIndex;
+      if (subdivFirstVertex === null) {
+        // Any vertex on a face with 4+ verts
+        const facesWithVert = getFacesForVertex(vi);
+        const hasEligibleFace = facesWithVert.some(fi => faces[fi].verts.length >= 4);
+        renderer.domElement.style.cursor = hasEligibleFace ? "pointer" : "not-allowed";
+      } else {
+        renderer.domElement.style.cursor = subdivEligibleVerts.includes(vi) ? "pointer" : "not-allowed";
+      }
+      return;
+    }
+    renderer.domElement.style.cursor = "default";
+    return;
+  }
+
+  // Edge hover - show crosshair cursor when hovering an edge
+  const edgeHits = raycaster.intersectObjects(edgeHitMeshes);
+  if (edgeHits.length > 0) {
+    renderer.domElement.style.cursor = "crosshair";
+    return;
+  }
+
+  renderer.domElement.style.cursor = "default";
+});
+
+renderer.domElement.addEventListener('mouseup', (e) => {
+  if (draggingPort !== null) { endPortDrag(); return; }
+
+  // Check for quick click
+  const elapsed = Date.now() - mouseDownTime;
+  if (!isDragging && mouseDownPos && elapsed < 400) {
+    const pxy = getPointerXY(e);
+    const dx = pxy.clientX - mouseDownPos.x;
+    const dy = pxy.clientY - mouseDownPos.y;
+    if (Math.sqrt(dx*dx + dy*dy) < 5) {
+      // Subdivide mode takes priority
+      if (subdivideMode) {
+        trySubdivideClick(pxy);
+      } else {
+        tryEdgeSplit(pxy);
+      }
+    }
+  }
+
+  endDrag();
+  mouseDownPos = null;
+});
+
+window.addEventListener('mouseup', () => { endPortDrag(); endDrag(); mouseDownPos = null; });
+
+// --- Keyboard Shortcuts for Undo/Redo ---
+window.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'z') {
+    e.preventDefault(); redo();
+  } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+    e.preventDefault(); undo();
+  } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+    e.preventDefault(); redo();
+  }
+});
+
+// --- Resize ---
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Bind swipe gestures to all three panels ---
+addSwipeGesture(statsPanel, {
+  onSwipeDown: () => { if (statsExpanded) { statsExpanded = false; updateStats(); } },
+  onSwipeUp: () => { if (!statsExpanded) { statsExpanded = true; updateStats(); } },
+});
+addSwipeGesture(portPanel, {
+  onSwipeDown: () => { if (portsExpanded) { portsExpanded = false; updatePortPanel(); } },
+  onSwipeUp: () => { if (!portsExpanded) { portsExpanded = true; updatePortPanel(); } },
+});
+addSwipeGesture(tsPanel, {
+  onSwipeDown: () => { if (tsExpanded) { tsExpanded = false; updateTSPanel(); } },
+  onSwipeUp: () => { if (!tsExpanded) { tsExpanded = true; updateTSPanel(); } },
+});
+
+// --- Init ---
+updateAll();
+updateTSPanel();
+updateActionRow();
+
+// --- Animate ---
+const clock = new THREE.Clock();
+function animate() {
+  const t = clock.getElapsedTime();
+  handles.forEach((h, i) => {
+    if (h !== selectedHandle && h.children[0]) {
+      const isSplit = splitVertices.has(h.userData.vertexIndex);
+      const speed = isSplit ? 3 : 2;
+      const pulse = 1 + Math.sin(t * speed + i * 0.8) * 0.08;
+      h.children[0].scale.set(2.5 * pulse, 2.5 * pulse, 1);
+    }
+  });
+  portGroup.children.forEach(child => {
+    if (child.name && (child.name.startsWith('portGlow_') || child.name.startsWith('spkGlow_'))) {
+      if (child.material) child.material.opacity = 0.25 + Math.sin(t * 3) * 0.12;
+    }
+  });
+  controls.update();
+  renderer.render(scene, camera);
+}
+renderer.setAnimationLoop(animate);
+
